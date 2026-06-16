@@ -45,20 +45,38 @@ st.set_page_config(
 # Extra CSS tweaks
 st.markdown("""
 <style>
-    [data-testid="stSidebar"] { background-color: #0d1117; }
+    /* Sidebar — readable mid-dark, not pitch black */
+    [data-testid="stSidebar"] {
+        background-color: #1a2235;
+    }
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] span {
+        color: #a8b4c4 !important;
+        font-size: 0.88rem;
+    }
+    [data-testid="stSidebar"] input {
+        color: #c9d1d9 !important;
+        background-color: #253047 !important;
+    }
+    /* Tabs */
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] {
-        background-color: #161b22;
+        background-color: #1e2736;
         border-radius: 6px 6px 0 0;
         padding: 8px 20px;
         color: #8b949e;
     }
     .stTabs [aria-selected="true"] {
-        background-color: #21262d !important;
-        color: #e6edf3 !important;
+        background-color: #253047 !important;
+        color: #c9d1d9 !important;
     }
+    /* General text — softer than pure white */
+    h1, h2, h3, p, span, label { color: #c9d1d9; }
     div[data-testid="stDataFrame"] { border-radius: 8px; }
     .stButton > button { border-radius: 6px; font-weight: 600; }
+    /* Caption text */
+    [data-testid="stCaptionContainer"] p { color: #6e7f96 !important; }
 </style>
 """, unsafe_allow_html=True)
 
