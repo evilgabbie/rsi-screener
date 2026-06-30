@@ -859,9 +859,21 @@ with tab_calc:
             calc_interval = st.selectbox("Data Interval",
                                          ["Daily", "Weekly", "Monthly", "Annually"])
             today         = datetime.today()
-            calc_start    = st.date_input("Start Date",
-                                          value=today - timedelta(days=730))
-            calc_end      = st.date_input("End Date", value=today)
+            calc_start = st.date_input(
+                "Start Date",
+                value=today - timedelta(days=730),
+                min_value=datetime(1900, 1, 1),
+                max_value=today,
+                format="YYYY-MM-DD",
+                help="Type any year e.g. 1990-01-01",
+            )
+            calc_end = st.date_input(
+                "End Date",
+                value=today,
+                min_value=datetime(1900, 1, 1),
+                max_value=today,
+                format="YYYY-MM-DD",
+            )
 
         if st.button("⬇  Download & Build Excel", type="primary"):
             if not calc_ticker:
