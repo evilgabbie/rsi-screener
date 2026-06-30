@@ -663,21 +663,85 @@ def build_sd_excel(df, ticker, period, output) -> None:
     wb.save(output)
 
 
-def download_ohlc(ticker: str, start: str, end: str, interval: str) -> pd.DataFrame:
+def _download_yahoo_daily(ticker: str, start: str, end: str) -> pd.DataFrame:
     import yfinance as yf
-    yf_interval = "1mo" if interval == "1y" else interval
     df = yf.download(ticker, start=start, end=end,
-                     interval=yf_interval, auto_adjust=False, progress=False)
+                     interval="1d", auto_adjust=False, progress=False)
     if df.empty:
-        raise ValueError(f"No data found for '{ticker}'.")
+        raise ValueError(
+            f"No data found for '{ticker}' on Yahoo Finance.\n\n"
+            f"Yahoo does not carry true spot FX/metals (e.g. XAU/USD, XAG/USD). "
+            f"Switch the Data Source to Twelve Data for those instruments."
+        )
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    df = df[["Open", "High", "Low", "Close"]].dropna().sort_index()
-    if interval == "1y":
-        df = df.resample("YE").agg(
-            {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-        ).dropna()
-    return df
+    return df[["Open", "High", "Low", "Close"]].dropna().sort_index()
+
+
+def _download_twelvedata_daily(ticker: str, start: str, end: str, api_key: str) -> pd.DataFrame:
+    """
+    Pull daily OHLC from Twelve Data — covers true spot FX and metals
+    (XAU/USD, XAG/USD, EUR/USD, etc.) that Yahoo Finance does not carry.
+    Free tier: 800 requests/day, max 5000 bars per request.
+    """
+    if not api_key:
+        raise ValueError(
+            "Twelve Data requires a free API key.\n\n"
+            "Get one at https://twelvedata.com/pricing (free tier, no card)."
+        )
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol":      ticker,
+        "interval":    "1day",
+        "start_date":  start,
+        "end_date":    end,
+        "outputsize":  5000,
+        "apikey":      api_key,
+        "format":      "JSON",
+    }
+    resp = requests.get(url, params=params, timeout=25)
+    data = resp.json()
+
+    if isinstance(data, dict) and data.get("status") == "error":
+        raise ValueError(f"Twelve Data error: {data.get('message', 'unknown error')}")
+    if "values" not in data:
+        raise ValueError(f"No data found for '{ticker}' on Twelve Data.")
+
+    df = pd.DataFrame(data["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+    df = df.rename(columns={
+        "open": "Open", "high": "High", "low": "Low", "close": "Close"
+    })
+    for col in ["Open", "High", "Low", "Close"]:
+        df[col] = df[col].astype(float)
+    return df[["Open", "High", "Low", "Close"]].dropna()
+
+
+def _resample_ohlc(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """Resample daily OHLC to weekly / monthly / annual. interval in {1d,1wk,1mo,1y}."""
+    if interval == "1d":
+        return df
+    rule = {"1wk": "W", "1mo": "ME", "1y": "YE"}[interval]
+    return df.resample(rule).agg(
+        {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    ).dropna()
+
+
+def download_ohlc(
+    ticker: str, start: str, end: str, interval: str,
+    source: str = "yahoo", api_key: str = "",
+) -> pd.DataFrame:
+    """
+    source: "yahoo" (stocks/ETFs) or "twelvedata" (FX/metals spot).
+    Always fetches daily bars then resamples locally — keeps both
+    sources consistent for Weekly/Monthly/Annual.
+    """
+    if source == "twelvedata":
+        daily = _download_twelvedata_daily(ticker, start, end, api_key)
+    else:
+        daily = _download_yahoo_daily(ticker, start, end)
+    return _resample_ohlc(daily, interval)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -847,11 +911,40 @@ with tab_calc:
     if not HAS_XL:
         st.error("openpyxl is not installed. Add it to requirements.txt.")
     else:
+        src_choice = st.radio(
+            "Data Source",
+            ["Yahoo Finance  (stocks, ETFs)", "Twelve Data  (FX & spot metals)"],
+            horizontal=True,
+        )
+        is_twelvedata = src_choice.startswith("Twelve Data")
+
+        td_api_key = ""
+        if is_twelvedata:
+            # Pull from Streamlit Secrets if configured, else session state, else blank
+            secret_key = st.secrets.get("TWELVEDATA_API_KEY", "")
+            default_key = st.session_state.get("td_api_key", secret_key)
+
+            td_api_key = st.text_input(
+                "Twelve Data API Key",
+                value=default_key,
+                type="password",
+                help="Stored in Secrets by default — override here for this session only.",
+            )
+            st.session_state["td_api_key"] = td_api_key
+
+            if secret_key and td_api_key == secret_key:
+                st.caption("🔑 Using key from Streamlit Secrets")
+            st.caption(
+                "Examples: **XAU/USD** (gold spot) · **XAG/USD** (silver spot) · "
+                "**EUR/USD** · **GBP/JPY**"
+            )
+
         c1, c2 = st.columns(2)
         with c1:
-            calc_mode    = st.selectbox("Calculator", ["RSI", "Std Dev / Z-Score"])
-            calc_ticker  = st.text_input("Ticker Symbol", value="AAPL").upper().strip()
-            calc_period  = st.number_input(
+            calc_mode   = st.selectbox("Calculator", ["RSI", "Std Dev / Z-Score"])
+            default_tk  = "XAU/USD" if is_twelvedata else "AAPL"
+            calc_ticker = st.text_input("Ticker Symbol", value=default_tk).upper().strip()
+            calc_period = st.number_input(
                 "RSI Period" if calc_mode == "RSI" else "Rolling Window",
                 value=9 if calc_mode == "RSI" else 20, min_value=2
             )
@@ -878,6 +971,8 @@ with tab_calc:
         if st.button("⬇  Download & Build Excel", type="primary"):
             if not calc_ticker:
                 st.warning("Enter a ticker symbol.")
+            elif is_twelvedata and not td_api_key:
+                st.warning("Enter your Twelve Data API key first.")
             else:
                 with st.spinner(f"Downloading {calc_ticker} and building Excel…"):
                     try:
@@ -886,15 +981,18 @@ with tab_calc:
                         df_ohlc = download_ohlc(
                             calc_ticker,
                             str(calc_start), str(calc_end),
-                            iv_map[calc_interval]
+                            iv_map[calc_interval],
+                            source="twelvedata" if is_twelvedata else "yahoo",
+                            api_key=td_api_key,
                         )
                         buf = io.BytesIO()
+                        safe_ticker = calc_ticker.replace("/", "-")
                         if calc_mode == "RSI":
                             build_rsi_excel(df_ohlc, calc_ticker, calc_period, buf)
-                            fname = f"{calc_ticker}_RSI{sf_map[calc_interval]}.xlsx"
+                            fname = f"{safe_ticker}_RSI{sf_map[calc_interval]}.xlsx"
                         else:
                             build_sd_excel(df_ohlc, calc_ticker, calc_period, buf)
-                            fname = f"{calc_ticker}_SD_ZScore{sf_map[calc_interval]}.xlsx"
+                            fname = f"{safe_ticker}_SD_ZScore{sf_map[calc_interval]}.xlsx"
                         buf.seek(0)
                         st.success(f"✓  Built {len(df_ohlc)} rows of {calc_interval.lower()} data")
                         st.download_button(
