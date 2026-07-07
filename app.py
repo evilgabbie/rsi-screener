@@ -1,11 +1,13 @@
 """
 US Market RSI Screener — Streamlit Web App
 ══════════════════════════════════════════
-Screener   : NASDAQ + NYSE + AMEX, RSI(9) overbought / oversold
-Calculator : RSI & Std Dev / Z-Score Excel builder (download in browser)
-Pattern Guide : Pattern reference with descriptions
+Three screeners:
+  1. RSI Screen     — RSI(9) overbought / oversold, NASDAQ+NYSE+AMEX
+  2. Green Line     — EMA(250) + IBD-RS > 80 + Slow Stochastic(5,1) < 20 turning up
+  3. S&P 500 Movers — Top 3 gainers / losers by daily % change
 
-Deploy free at share.streamlit.io
+Calculator: RSI & Std Dev / Z-Score Excel builder (Yahoo Finance + Twelve Data)
+Pattern Guide: Pattern reference with descriptions
 """
 
 import io
@@ -36,54 +38,82 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="US Market RSI Screener",
+    page_title="US Market Screener",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Extra CSS tweaks
 st.markdown("""
 <style>
-    /* Sidebar — readable mid-dark, not pitch black */
-    [data-testid="stSidebar"] {
-        background-color: #1a2235;
-    }
+    [data-testid="stSidebar"] { background-color: #1a2235; }
     [data-testid="stSidebar"] label,
     [data-testid="stSidebar"] p,
-    [data-testid="stSidebar"] span {
-        color: #a8b4c4 !important;
-        font-size: 0.88rem;
-    }
-    [data-testid="stSidebar"] input {
-        color: #c9d1d9 !important;
-        background-color: #253047 !important;
-    }
-    /* Tabs */
+    [data-testid="stSidebar"] span { color: #a8b4c4 !important; font-size: 0.88rem; }
+    [data-testid="stSidebar"] input { color: #c9d1d9 !important; background-color: #253047 !important; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] {
-        background-color: #1e2736;
-        border-radius: 6px 6px 0 0;
-        padding: 8px 20px;
-        color: #8b949e;
+        background-color: #1e2736; border-radius: 6px 6px 0 0;
+        padding: 8px 20px; color: #8b949e;
     }
     .stTabs [aria-selected="true"] {
-        background-color: #253047 !important;
-        color: #c9d1d9 !important;
+        background-color: #253047 !important; color: #c9d1d9 !important;
     }
-    /* General text — softer than pure white */
     h1, h2, h3, p, span, label { color: #c9d1d9; }
     div[data-testid="stDataFrame"] { border-radius: 8px; }
     .stButton > button { border-radius: 6px; font-weight: 600; }
-    /* Caption text */
     [data-testid="stCaptionContainer"] p { color: #6e7f96 !important; }
+    .metric-box {
+        background: #1e2736; border-radius: 8px; padding: 14px 18px;
+        border-left: 4px solid; margin-bottom: 8px;
+    }
+    .metric-green { border-color: #3fb950; }
+    .metric-red   { border-color: #f85149; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  RSI
+#  INDICATORS
 # ══════════════════════════════════════════════════════════════════
+
+
+def _extract_hist(raw, ticker: str, is_single: bool):
+    """
+    Robust extraction from yfinance batch download.
+    Handles all MultiIndex layouts across yfinance versions.
+    Returns a flat OHLCV DataFrame or None.
+    """
+    try:
+        if is_single:
+            df = raw.copy()
+            if isinstance(df.columns, pd.MultiIndex):
+                lvl0 = df.columns.get_level_values(0).tolist()
+                lvl1 = df.columns.get_level_values(1).tolist()
+                if "Close" in lvl0:
+                    df.columns = df.columns.droplevel(1)
+                elif "Close" in lvl1:
+                    df.columns = df.columns.droplevel(0)
+                else:
+                    df.columns = [c[0] if c[0] != "" else c[1] for c in df.columns]
+        else:
+            if not isinstance(raw.columns, pd.MultiIndex):
+                return None
+            lvl0 = raw.columns.get_level_values(0).tolist()
+            lvl1 = raw.columns.get_level_values(1).tolist()
+            if ticker in lvl1:
+                df = raw.xs(ticker, axis=1, level=1)
+            elif ticker in lvl0:
+                df = raw[ticker]
+            else:
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(0)
+
+        df = df.dropna(how="all")
+        return df if not df.empty else None
+    except Exception:
+        return None
 
 def wilder_rsi(closes: np.ndarray, period: int) -> float:
     need = period * 3
@@ -116,6 +146,44 @@ def rsi_series(closes: np.ndarray, period: int) -> np.ndarray:
         ag = (ag * (period - 1) + g[i]) / period
         al = (al * (period - 1) + l[i]) / period
         out[i + 1] = _r(ag, al)
+    return out
+
+
+def slow_stochastic(hist: pd.DataFrame, k_period: int = 5) -> tuple[float, float]:
+    """
+    Slow Stochastic %K(k_period, 1).
+    Returns (current_k, previous_k). Both NaN if insufficient data.
+    Smoothing=1 means raw %K — no additional SMA applied.
+    """
+    if len(hist) < k_period + 1:
+        return float("nan"), float("nan")
+    hi = hist["High"].values.astype(float)
+    lo = hist["Low"].values.astype(float)
+    cl = hist["Close"].values.astype(float)
+
+    def _k(idx):
+        window_lo = lo[idx - k_period + 1: idx + 1]
+        window_hi = hi[idx - k_period + 1: idx + 1]
+        rng = window_hi.max() - window_lo.min()
+        if rng == 0:
+            return 50.0
+        return (cl[idx] - window_lo.min()) / rng * 100.0
+
+    n = len(cl)
+    curr = _k(n - 1)
+    prev = _k(n - 2)
+    return curr, prev
+
+
+def ema_series(closes: np.ndarray, period: int) -> np.ndarray:
+    """Exponential moving average series."""
+    out = np.full(len(closes), np.nan)
+    if len(closes) < period:
+        return out
+    k = 2.0 / (period + 1)
+    out[period - 1] = closes[:period].mean()
+    for i in range(period, len(closes)):
+        out[i] = closes[i] * k + out[i - 1] * (1 - k)
     return out
 
 
@@ -247,7 +315,7 @@ PATTERN_DESCRIPTIONS = {
 
 
 # ══════════════════════════════════════════════════════════════════
-#  DATA  ──  NASDAQ + NYSE + AMEX  →  yfinance
+#  UNIVERSE FETCH  (shared by RSI and Green Line screens)
 # ══════════════════════════════════════════════════════════════════
 
 _REQ_HEADERS = {
@@ -259,7 +327,9 @@ _REQ_HEADERS = {
 }
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_us_universe(min_price: float) -> list[str]:
+    """Pull NASDAQ + NYSE + AMEX, pre-filter by price. Cached 1hr."""
     seen: set[str] = set()
     out:  list[str] = []
     for exchange in ("nasdaq", "nyse", "amex"):
@@ -290,7 +360,11 @@ def fetch_us_universe(min_price: float) -> list[str]:
     return out
 
 
-def screen(
+# ══════════════════════════════════════════════════════════════════
+#  SCREENER 1 — RSI(9)
+# ══════════════════════════════════════════════════════════════════
+
+def screen_rsi(
     tickers, min_price, min_avg_vol, min_curr_vol,
     rsi9_ob, rsi9_os, progress_cb=None,
 ) -> tuple[list[dict], list[dict], dict]:
@@ -301,28 +375,17 @@ def screen(
     for i in range(0, total, BATCH):
         batch = tickers[i: i + BATCH]
         if progress_cb:
-            progress_cb(
-                int(i / total * 50),
-                f"Downloading batch {i // BATCH + 1} / {-(-total // BATCH)}"
-            )
+            progress_cb(int(i / total * 50),
+                        f"Downloading batch {i // BATCH + 1} / {-(-total // BATCH)}")
         try:
             raw = yf.download(tickers=batch, period="4mo", interval="1d",
                               auto_adjust=True, progress=False, group_by="ticker")
             if not raw.empty:
-                if len(batch) == 1:
-                    sub = raw.copy()
-                    if isinstance(sub.columns, pd.MultiIndex):
-                        sub.columns = sub.columns.droplevel(1)
-                    if not sub.empty:
-                        cache[batch[0]] = sub
-                else:
-                    for t in batch:
-                        try:
-                            sub = raw[t].dropna(how="all")
-                            if not sub.empty:
-                                cache[t] = sub
-                        except Exception:
-                            pass
+                single = len(batch) == 1
+                for t in batch:
+                    sub = _extract_hist(raw, t, single)
+                    if sub is not None:
+                        cache[t] = sub
         except Exception:
             pass
         time.sleep(0.25)
@@ -330,10 +393,8 @@ def screen(
     n_h = len(cache)
     for idx, (t, hist) in enumerate(cache.items()):
         if progress_cb:
-            progress_cb(
-                50 + int(idx / max(n_h, 1) * 50),
-                f"Screening {t}  ({idx + 1} / {n_h})"
-            )
+            progress_cb(50 + int(idx / max(n_h, 1) * 50),
+                        f"Screening {t}  ({idx + 1} / {n_h})")
         hist = hist.dropna(subset=["Close", "Volume"])
         if len(hist) < 20:
             continue
@@ -358,11 +419,225 @@ def screen(
 
 
 # ══════════════════════════════════════════════════════════════════
+#  SCREENER 2 — GREEN LINE
+#  Rules: Close > EMA(250)  AND  IBD-RS > 80  AND
+#         Slow Stochastic(5,1) < 20 AND today > yesterday
+# ══════════════════════════════════════════════════════════════════
+
+def screen_green_line(
+    tickers, min_price, min_avg_vol, rs_threshold,
+    progress_cb=None,
+) -> tuple[list[dict], dict]:
+    """
+    Requires 15 months of daily OHLCV per ticker:
+      - EMA(250) needs 250 trading days
+      - IBD-RS needs 252 trading days (12-month return)
+      - Stochastic(5,1) needs 5 days
+
+    IBD-RS approximation: 12-month price return percentile within
+    the scan universe. Not identical to SCTR — peer ranking is
+    the unresolvable gap without a StockCharts API subscription.
+
+    Slow Stochastic trigger: loose — %K < 20 AND today > yesterday
+    (entry while still in green zone, matching the chart examples).
+    """
+    import yfinance as yf
+
+    results = []
+    cache   = {}
+    total, BATCH = len(tickers), 25   # smaller batches — 15mo is heavy
+
+    # ── Download 15mo daily bars ────────────────────────────────
+    for i in range(0, total, BATCH):
+        batch = tickers[i: i + BATCH]
+        if progress_cb:
+            progress_cb(
+                int(i / total * 60),
+                f"Downloading batch {i // BATCH + 1} / {-(-total // BATCH)}  "
+                f"(15mo data — this scan runs slower)"
+            )
+        try:
+            raw = yf.download(tickers=batch, period="15mo", interval="1d",
+                              auto_adjust=True, progress=False, group_by="ticker")
+            if not raw.empty:
+                single = len(batch) == 1
+                for t in batch:
+                    sub = _extract_hist(raw, t, single)
+                    if sub is not None:
+                        cache[t] = sub
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+    # ── Compute 12-month returns for RS percentile ───────────────
+    returns_12m: dict[str, float] = {}
+    for t, hist in cache.items():
+        hist = hist.dropna(subset=["Close"])
+        if len(hist) < 252:
+            continue
+        price_now  = float(hist["Close"].values[-1])
+        price_year = float(hist["Close"].values[-252])
+        if price_year > 0:
+            returns_12m[t] = (price_now - price_year) / price_year
+
+    if not returns_12m:
+        return [], cache
+
+    # Rank into percentiles within this scan universe
+    sorted_tickers = sorted(returns_12m, key=returns_12m.get)
+    rs_rank = {
+        t: (i / max(len(sorted_tickers) - 1, 1)) * 100
+        for i, t in enumerate(sorted_tickers)
+    }
+
+    # ── Screen each ticker ───────────────────────────────────────
+    n_h = len(cache)
+    for idx, (t, hist) in enumerate(cache.items()):
+        if progress_cb:
+            progress_cb(
+                60 + int(idx / max(n_h, 1) * 40),
+                f"Screening {t}  ({idx + 1} / {n_h})"
+            )
+        hist = hist.dropna(subset=["Close", "High", "Low", "Volume"])
+        if len(hist) < 252:
+            continue
+
+        c   = hist["Close"].values.astype(float)
+        v   = hist["Volume"].values.astype(float)
+
+        price   = c[-1]
+        avg_vol = float(v[-20:].mean())
+
+        if price < min_price or avg_vol < min_avg_vol:
+            continue
+
+        # Rule 1 — above EMA(250)
+        ema250 = ema_series(c, 250)
+        if np.isnan(ema250[-1]) or price <= ema250[-1]:
+            continue
+
+        # Rule 2 — IBD-RS percentile > threshold
+        rs = rs_rank.get(t, 0.0)
+        if rs < rs_threshold:
+            continue
+
+        # Rule 3 — Slow Stochastic(5,1) < 20 AND turning up
+        k_curr, k_prev = slow_stochastic(hist, k_period=5)
+        if np.isnan(k_curr) or np.isnan(k_prev):
+            continue
+        if k_curr >= 20 or k_curr <= k_prev:
+            continue
+
+        pct_above_ema = (price - ema250[-1]) / ema250[-1] * 100
+        results.append(dict(
+            Ticker        = t,
+            Price         = f"${price:.2f}",
+            AvgVol        = f"{avg_vol:,.0f}",
+            EMA250        = f"${ema250[-1]:.2f}",
+            PctAboveEMA   = f"{pct_above_ema:.1f}%",
+            RS            = f"{rs:.0f}",
+            Stoch         = f"{k_curr:.1f}",
+            _rs           = rs,
+        ))
+
+    results.sort(key=lambda r: r["_rs"], reverse=True)
+    return results, cache
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SCREENER 3 — S&P 500 MOVERS
+#  Top 3 gainers + top 3 losers by daily % change
+#  Universe: S&P 500 components from Wikipedia (stays current)
+# ══════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_sp500_tickers() -> list[str]:
+    """Pull S&P 500 constituent list from Wikipedia. Cached 1hr."""
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    try:
+        tables = pd.read_html(url)
+        tickers = tables[0]["Symbol"].tolist()
+        # Wikipedia uses dots (BRK.B) — yfinance uses dashes (BRK-B)
+        return [t.replace(".", "-") for t in tickers]
+    except Exception:
+        return []
+
+
+def screen_sp500_movers(progress_cb=None) -> list[dict]:
+    """
+    Pulls 2 days of daily OHLCV for all S&P 500 components,
+    computes daily % change, returns top 3 + bottom 3.
+    """
+    import yfinance as yf
+
+    tickers = fetch_sp500_tickers()
+    if not tickers:
+        return []
+
+    if progress_cb:
+        progress_cb(10, f"Fetching {len(tickers)} S&P 500 components…")
+
+    BATCH = 50
+    results = []
+
+    for i in range(0, len(tickers), BATCH):
+        batch = tickers[i: i + BATCH]
+        if progress_cb:
+            progress_cb(
+                10 + int(i / len(tickers) * 80),
+                f"Downloading batch {i // BATCH + 1} / {-(-len(tickers) // BATCH)}"
+            )
+        try:
+            raw = yf.download(tickers=batch, period="5d", interval="1d",
+                              auto_adjust=True, progress=False, group_by="ticker")
+            if raw.empty:
+                continue
+
+            single = len(batch) == 1
+            for t in batch:
+                try:
+                    sub = _extract_hist(raw, t, single)
+                    if sub is None or len(sub) < 2:
+                        continue
+                    closes = sub["Close"].dropna().values.astype(float)
+                    if len(closes) < 2:
+                        continue
+                    prev_close, curr_close = closes[-2], closes[-1]
+                    if prev_close <= 0:
+                        continue
+                    pct = (curr_close - prev_close) / prev_close * 100
+                    vol = float(sub["Volume"].values[-1]) if "Volume" in sub.columns else 0
+                    results.append(dict(
+                        Ticker=t, Price=f"${curr_close:.2f}",
+                        Change=f"{pct:+.2f}%", Volume=f"{vol:,.0f}", _pct=pct,
+                    ))
+                except Exception:
+                    pass
+                    pass
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+    if not results:
+        return []
+
+    results.sort(key=lambda r: r["_pct"], reverse=True)
+    gainers = results[:3]
+    losers  = results[-3:][::-1]   # worst first
+
+    # Tag each row
+    for r in gainers: r["Side"] = "Gainer"
+    for r in losers:  r["Side"] = "Loser"
+
+    return gainers + losers
+
+
+# ══════════════════════════════════════════════════════════════════
 #  PLOTLY CHART
 # ══════════════════════════════════════════════════════════════════
 
 def make_chart(ticker: str, hist: pd.DataFrame, pattern: str,
-               ob_thr: float, os_thr: float) -> go.Figure:
+               ob_thr: float = 80, os_thr: float = 20) -> go.Figure:
     c  = hist["Close"].values.astype(float)
     v  = hist["Volume"].values.astype(float)
     dt = hist.index
@@ -372,88 +647,117 @@ def make_chart(ticker: str, hist: pd.DataFrame, pattern: str,
                   for i in range(len(c))]
 
     fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.58, 0.16, 0.26],
-        vertical_spacing=0.03,
-        subplot_titles=[
-            f"<b>{ticker}</b>  —  {pattern}",
-            "Volume",
-            "RSI(9)",
-        ],
+        rows=3, cols=1, shared_xaxes=True,
+        row_heights=[0.58, 0.16, 0.26], vertical_spacing=0.03,
+        subplot_titles=[f"<b>{ticker}</b>  —  {pattern}", "Volume", "RSI(9)"],
     )
-
-    # ── Price ──────────────────────────────────────────────────
     fig.add_trace(go.Scatter(
-        x=dt, y=c,
-        fill="tozeroy",
-        fillcolor="rgba(63,185,80,0.08)",
-        line=dict(color="#3fb950", width=1.5),
-        name="Close",
+        x=dt, y=c, fill="tozeroy", fillcolor="rgba(63,185,80,0.08)",
+        line=dict(color="#3fb950", width=1.5), name="Close",
         hovertemplate="$%{y:.2f}<extra></extra>",
     ), row=1, col=1)
-
-    # ── Volume ─────────────────────────────────────────────────
     fig.add_trace(go.Bar(
-        x=dt, y=v,
-        marker_color=bar_colors,
-        opacity=0.6,
-        name="Volume",
+        x=dt, y=v, marker_color=bar_colors, opacity=0.6, name="Volume",
         hovertemplate="%{y:,.0f}<extra></extra>",
     ), row=2, col=1)
-
-    # ── RSI ────────────────────────────────────────────────────
-    fig.add_hrect(y0=ob_thr, y1=100,
-                  fillcolor="rgba(248,81,73,0.08)", line_width=0,
-                  row=3, col=1)
-    fig.add_hrect(y0=0, y1=os_thr,
-                  fillcolor="rgba(63,185,80,0.08)", line_width=0,
-                  row=3, col=1)
+    fig.add_hrect(y0=ob_thr, y1=100, fillcolor="rgba(248,81,73,0.08)",
+                  line_width=0, row=3, col=1)
+    fig.add_hrect(y0=0, y1=os_thr, fillcolor="rgba(63,185,80,0.08)",
+                  line_width=0, row=3, col=1)
     fig.add_hline(y=ob_thr, line_dash="dash", line_color="#f85149",
                   line_width=1, opacity=0.7, row=3, col=1)
     fig.add_hline(y=os_thr, line_dash="dash", line_color="#3fb950",
                   line_width=1, opacity=0.7, row=3, col=1)
     fig.add_trace(go.Scatter(
-        x=dt, y=rs,
-        line=dict(color="#f0b429", width=1.3),
-        name="RSI(9)",
+        x=dt, y=rs, line=dict(color="#f0b429", width=1.3), name="RSI(9)",
         hovertemplate="RSI %{y:.1f}<extra></extra>",
     ), row=3, col=1)
-
     rsi_last = rs[~np.isnan(rs)][-1] if np.any(~np.isnan(rs)) else float("nan")
-
-    # ── Layout ─────────────────────────────────────────────────
     fig.update_layout(
-        plot_bgcolor="#161b22",
-        paper_bgcolor="#0d1117",
-        font=dict(color="#e6edf3", size=11),
-        height=580,
-        showlegend=False,
-        margin=dict(l=10, r=10, t=40, b=10),
-        hovermode="x unified",
-        hoverlabel=dict(bgcolor="#21262d", font_color="#e6edf3"),
+        plot_bgcolor="#161b22", paper_bgcolor="#0d1117",
+        font=dict(color="#e6edf3", size=11), height=560,
+        showlegend=False, margin=dict(l=10, r=10, t=40, b=10),
+        hovermode="x unified", hoverlabel=dict(bgcolor="#21262d", font_color="#e6edf3"),
     )
-    fig.update_xaxes(
-        gridcolor="#21262d", showgrid=True,
-        zeroline=False, showline=False,
-        rangeslider_visible=False,
-    )
+    fig.update_xaxes(gridcolor="#21262d", showgrid=True,
+                     zeroline=False, rangeslider_visible=False)
     fig.update_yaxes(gridcolor="#21262d", showgrid=True, zeroline=False)
     fig.update_yaxes(tickprefix="$", row=1, col=1)
-    fig.update_yaxes(range=[0, 100], tickvals=[0, os_thr, 50, ob_thr, 100],
-                     row=3, col=1)
-
+    fig.update_yaxes(range=[0, 100], tickvals=[0, os_thr, 50, ob_thr, 100], row=3, col=1)
     if not np.isnan(rsi_last):
-        fig.update_layout(title_text=None)
         fig.layout.annotations[0].text = (
-            f"<b>{ticker}</b>  —  RSI {rsi_last:.1f}  —  {pattern}"
+            f"<b>{ticker}</b>  RSI {rsi_last:.1f}  —  {pattern}"
         )
+    return fig
 
+
+def make_gl_chart(ticker: str, hist: pd.DataFrame) -> go.Figure:
+    """Green Line chart: price + EMA(250) + Stochastic(5,1)."""
+    c  = hist["Close"].values.astype(float)
+    h  = hist["High"].values.astype(float)
+    lo = hist["Low"].values.astype(float)
+    v  = hist["Volume"].values.astype(float)
+    dt = hist.index
+    e250 = ema_series(c, 250)
+
+    # Stochastic series
+    k_series = np.full(len(c), np.nan)
+    for i in range(4, len(c)):
+        rng = h[i-4:i+1].max() - lo[i-4:i+1].min()
+        if rng > 0:
+            k_series[i] = (c[i] - lo[i-4:i+1].min()) / rng * 100
+
+    bar_colors = ["#3fb950" if i == 0 or c[i] >= c[i-1] else "#f85149"
+                  for i in range(len(c))]
+
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        row_heights=[0.55, 0.15, 0.30], vertical_spacing=0.03,
+        subplot_titles=[f"<b>{ticker}</b>  —  Price + EMA(250)", "Volume", "Slow Stoch(5,1)"],
+    )
+    fig.add_trace(go.Scatter(
+        x=dt, y=c, line=dict(color="#3fb950", width=1.4),
+        name="Close", hovertemplate="$%{y:.2f}<extra></extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=dt, y=e250, line=dict(color="#22c55e", width=1.8, dash="solid"),
+        name="EMA(250)", opacity=0.85, hovertemplate="EMA $%{y:.2f}<extra></extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=dt, y=v, marker_color=bar_colors, opacity=0.55, name="Volume",
+        hovertemplate="%{y:,.0f}<extra></extra>",
+    ), row=2, col=1)
+    fig.add_hrect(y0=0,  y1=20, fillcolor="rgba(63,185,80,0.10)",
+                  line_width=0, row=3, col=1)
+    fig.add_hrect(y0=80, y1=100, fillcolor="rgba(248,81,73,0.10)",
+                  line_width=0, row=3, col=1)
+    fig.add_hline(y=20, line_dash="dash", line_color="#3fb950",
+                  line_width=1, opacity=0.7, row=3, col=1)
+    fig.add_hline(y=80, line_dash="dash", line_color="#f85149",
+                  line_width=1, opacity=0.7, row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=dt, y=k_series, line=dict(color="#f0b429", width=1.3),
+        name="Stoch%K", hovertemplate="%{y:.1f}<extra></extra>",
+    ), row=3, col=1)
+    fig.update_layout(
+        plot_bgcolor="#161b22", paper_bgcolor="#0d1117",
+        font=dict(color="#e6edf3", size=11), height=560,
+        showlegend=True,
+        legend=dict(bgcolor="#1e2736", bordercolor="#253047",
+                    font=dict(color="#c9d1d9")),
+        margin=dict(l=10, r=10, t=40, b=10),
+        hovermode="x unified", hoverlabel=dict(bgcolor="#21262d", font_color="#e6edf3"),
+    )
+    fig.update_xaxes(gridcolor="#21262d", showgrid=True,
+                     zeroline=False, rangeslider_visible=False)
+    fig.update_yaxes(gridcolor="#21262d", showgrid=True, zeroline=False)
+    fig.update_yaxes(tickprefix="$", row=1, col=1)
+    fig.update_yaxes(range=[0, 100], tickvals=[0, 20, 50, 80, 100], row=3, col=1)
     return fig
 
 
 # ══════════════════════════════════════════════════════════════════
-#  EXCEL BUILDERS  (identical logic, accept BytesIO)
+#  EXCEL BUILDERS
 # ══════════════════════════════════════════════════════════════════
 
 def _styler():
@@ -485,8 +789,7 @@ def build_rsi_excel(df, ticker, period, output) -> None:
     c = ws["A1"]
     c.value = f"RSI CALCULATOR  ·  {ticker.upper()}  ·  Open · High · Low · Close"
     st_cell(c, bold=True, fg=HDR_FG, bg=HDR_BG, align="center", sz=14)
-    ws.row_dimensions[1].height = 32
-    ws.row_dimensions[2].height = 26
+    ws.row_dimensions[1].height = 32; ws.row_dimensions[2].height = 26
     ws["A2"].value = "RSI Period:"; st_cell(ws["A2"], bold=True, fg=HDR_FG, bg=HDR_BG, sz=10); bdr(ws["A2"],"999999")
     ws["B2"].value = period; st_cell(ws["B2"], bold=True, fg=INP_FG, bg=INP_BG, align="center", fmt="0", sz=11); bdr(ws["B2"],"999999")
     ws["C2"].value = "← Period"; st_cell(ws["C2"], fg=GRAY, bg="F5F5F5", sz=9, italic=True); bdr(ws["C2"],"DDDDDD")
@@ -573,7 +876,7 @@ def build_sd_excel(df, ticker, period, output) -> None:
     st_cell, bdr = _styler()
     wb = Workbook(); ws = wb.active; ws.title = "SD_ZSCORE"
     P, DS = "$B$2", 4; MAX_R = DS + len(df)
-    HDR_BG="1F3864"; HDR_FG="FFFFFF"; INP_BG="FFF2CC"; INP_FG="0000FF"
+    HDR_BG="1F3864"; HDR_FG="FFFFFF"; INP_BG="FFF2CC"
     WHITE="FFFFFF"; ALT="F2F7FB"; GRAY="888888"
     ws.sheet_view.showGridLines = True
     for col, w in [("A",13),("B",11),("C",11),("D",11),("E",11),
@@ -586,7 +889,7 @@ def build_sd_excel(df, ticker, period, output) -> None:
     st_cell(c, bold=True, fg=HDR_FG, bg=HDR_BG, align="center", sz=14)
     ws.row_dimensions[1].height = 32; ws.row_dimensions[2].height = 26
     ws["A2"].value = "Rolling Window:"; st_cell(ws["A2"], bold=True, fg=HDR_FG, bg=HDR_BG, sz=10); bdr(ws["A2"],"999999")
-    ws["B2"].value = period; st_cell(ws["B2"], bold=True, fg=INP_FG, bg=INP_BG, align="center", fmt="0", sz=11); bdr(ws["B2"],"999999")
+    ws["B2"].value = period; st_cell(ws["B2"], bold=True, fg="0000FF", bg="FFF2CC", align="center", fmt="0", sz=11); bdr(ws["B2"],"999999")
     ws.merge_cells("C2:M2"); ws["C2"].value = "← Change window. SD & Z-Score recalc automatically."
     st_cell(ws["C2"], fg=GRAY, bg="F5F5F5", sz=9, italic=True); bdr(ws["C2"],"DDDDDD")
     headers = [(1,"DATE",HDR_BG),(2,"OPEN",HDR_BG),(3,"HIGH",HDR_BG),(4,"LOW",HDR_BG),
@@ -647,9 +950,9 @@ def build_sd_excel(df, ticker, period, output) -> None:
         st_cell(c2, bold=True, fg="FFFFFF", bg=series_colors[col_idx], align="center", sz=9)
         zvals = z_values[col_idx]
         for b in range(n_bins):
-            lo, hi = bin_edges[b], bin_edges[b+1]; r = hr + 1 + b
-            label = f"{lo:+.1f} to {hi:+.1f}"
-            count = int(((zvals >= lo) & (zvals <= hi if b == n_bins-1 else zvals < hi)).sum())
+            lo_b, hi_b = bin_edges[b], bin_edges[b+1]; r = hr + 1 + b
+            label = f"{lo_b:+.1f} to {hi_b:+.1f}"
+            count = int(((zvals >= lo_b) & (zvals <= hi_b if b == n_bins-1 else zvals < hi_b)).sum())
             lc = ws.cell(row=r, column=bin_col, value=label)
             fc = ws.cell(row=r, column=freq_col, value=count)
             abg = ALT if r % 2 == 0 else WHITE
@@ -663,85 +966,48 @@ def build_sd_excel(df, ticker, period, output) -> None:
     wb.save(output)
 
 
-def _download_yahoo_daily(ticker: str, start: str, end: str) -> pd.DataFrame:
+def download_ohlc(ticker, start, end, interval,
+                  source="yahoo", api_key="") -> pd.DataFrame:
     import yfinance as yf
-    df = yf.download(ticker, start=start, end=end,
-                     interval="1d", auto_adjust=False, progress=False)
-    if df.empty:
-        raise ValueError(
-            f"No data found for '{ticker}' on Yahoo Finance.\n\n"
-            f"Yahoo does not carry true spot FX/metals (e.g. XAU/USD, XAG/USD). "
-            f"Switch the Data Source to Twelve Data for those instruments."
-        )
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df[["Open", "High", "Low", "Close"]].dropna().sort_index()
 
+    def _resample(df, iv):
+        if iv == "1d": return df
+        rule = {"1wk":"W","1mo":"ME","1y":"YE"}[iv]
+        return df.resample(rule).agg(
+            {"Open":"first","High":"max","Low":"min","Close":"last"}
+        ).dropna()
 
-def _download_twelvedata_daily(ticker: str, start: str, end: str, api_key: str) -> pd.DataFrame:
-    """
-    Pull daily OHLC from Twelve Data — covers true spot FX and metals
-    (XAU/USD, XAG/USD, EUR/USD, etc.) that Yahoo Finance does not carry.
-    Free tier: 800 requests/day, max 5000 bars per request.
-    """
-    if not api_key:
-        raise ValueError(
-            "Twelve Data requires a free API key.\n\n"
-            "Get one at https://twelvedata.com/pricing (free tier, no card)."
-        )
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol":      ticker,
-        "interval":    "1day",
-        "start_date":  start,
-        "end_date":    end,
-        "outputsize":  5000,
-        "apikey":      api_key,
-        "format":      "JSON",
-    }
-    resp = requests.get(url, params=params, timeout=25)
-    data = resp.json()
-
-    if isinstance(data, dict) and data.get("status") == "error":
-        raise ValueError(f"Twelve Data error: {data.get('message', 'unknown error')}")
-    if "values" not in data:
-        raise ValueError(f"No data found for '{ticker}' on Twelve Data.")
-
-    df = pd.DataFrame(data["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.set_index("datetime").sort_index()
-    df = df.rename(columns={
-        "open": "Open", "high": "High", "low": "Low", "close": "Close"
-    })
-    for col in ["Open", "High", "Low", "Close"]:
-        df[col] = df[col].astype(float)
-    return df[["Open", "High", "Low", "Close"]].dropna()
-
-
-def _resample_ohlc(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    """Resample daily OHLC to weekly / monthly / annual. interval in {1d,1wk,1mo,1y}."""
-    if interval == "1d":
-        return df
-    rule = {"1wk": "W", "1mo": "ME", "1y": "YE"}[interval]
-    return df.resample(rule).agg(
-        {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-    ).dropna()
-
-
-def download_ohlc(
-    ticker: str, start: str, end: str, interval: str,
-    source: str = "yahoo", api_key: str = "",
-) -> pd.DataFrame:
-    """
-    source: "yahoo" (stocks/ETFs) or "twelvedata" (FX/metals spot).
-    Always fetches daily bars then resamples locally — keeps both
-    sources consistent for Weekly/Monthly/Annual.
-    """
     if source == "twelvedata":
-        daily = _download_twelvedata_daily(ticker, start, end, api_key)
+        if not api_key:
+            raise ValueError(
+                "Twelve Data requires a free API key.\n"
+                "Get one at https://twelvedata.com/pricing (no card required)."
+            )
+        params = dict(symbol=ticker, interval="1day", start_date=start,
+                      end_date=end, outputsize=5000, apikey=api_key, format="JSON")
+        data = requests.get("https://api.twelvedata.com/time_series",
+                            params=params, timeout=25).json()
+        if data.get("status") == "error":
+            raise ValueError(f"Twelve Data: {data.get('message','unknown error')}")
+        if "values" not in data:
+            raise ValueError(f"No data for '{ticker}' on Twelve Data.")
+        df = pd.DataFrame(data["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.set_index("datetime").sort_index()
+        df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"})
+        for col in ["Open","High","Low","Close"]:
+            df[col] = df[col].astype(float)
+        return _resample(df[["Open","High","Low","Close"]].dropna(), interval)
     else:
-        daily = _download_yahoo_daily(ticker, start, end)
-    return _resample_ohlc(daily, interval)
+        yf_iv = "1mo" if interval == "1y" else interval
+        df = yf.download(ticker, start=start, end=end,
+                         interval=yf_iv, auto_adjust=False, progress=False)
+        if df.empty:
+            raise ValueError(f"No data for '{ticker}' on Yahoo Finance.")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[["Open","High","Low","Close"]].dropna().sort_index()
+        return _resample(df, interval)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -749,159 +1015,312 @@ def download_ohlc(
 # ══════════════════════════════════════════════════════════════════
 
 for key, default in [
-    ("ob_results",  []),
-    ("os_results",  []),
-    ("hist_cache",  {}),
-    ("scan_done",   False),
+    ("rsi_ob",      []),
+    ("rsi_os",      []),
+    ("rsi_cache",   {}),
+    ("rsi_done",    False),
+    ("gl_results",  []),
+    ("gl_cache",    {}),
+    ("gl_done",     False),
+    ("sp_results",  []),
+    ("sp_done",     False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-DCOLS_DISPLAY = ["Ticker", "Price", "CurrVol", "AvgVol", "RSI9", "Pattern"]
-COL_RENAME    = {"CurrVol": "Curr Vol", "AvgVol": "Avg Vol", "RSI9": "RSI(9)"}
+RSI_COLS    = ["Ticker","Price","CurrVol","AvgVol","RSI9","Pattern"]
+RSI_RENAME  = {"CurrVol":"Curr Vol","AvgVol":"Avg Vol","RSI9":"RSI(9)"}
+GL_COLS     = ["Ticker","Price","AvgVol","EMA250","PctAboveEMA","RS","Stoch"]
+GL_RENAME   = {"AvgVol":"Avg Vol","EMA250":"EMA(250)","PctAboveEMA":"% > EMA","RS":"IBD-RS","Stoch":"Stoch(5,1)"}
+SP_COLS     = ["Ticker","Price","Change","Volume","Side"]
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SIDEBAR  ──  FILTERS
+#  SIDEBAR
 # ══════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.title("📈 RSI Screener")
+    st.title("📈 US Market Screener")
     st.markdown("---")
-    st.subheader("⚙️ Filters")
 
-    min_price  = st.number_input("Min Price ($)",   value=90.0,   step=5.0,   format="%.0f")
-    avg_vol_k  = st.number_input("Avg Vol (k)",     value=500,    step=100)
-    curr_vol_k = st.number_input("Curr Vol (k)",    value=1000,   step=100)
-    rsi9_ob    = st.number_input("RSI(9) OB  >",   value=80.0,   step=1.0,   format="%.0f")
-    rsi9_os    = st.number_input("RSI(9) OS  <",   value=20.0,   step=1.0,   format="%.0f")
+    screen_choice = st.radio(
+        "Run Screen",
+        ["RSI Screen", "Green Line", "S&P 500 Movers"],
+        label_visibility="collapsed",
+    )
+    st.markdown("---")
+
+    if screen_choice == "RSI Screen":
+        st.subheader("⚙️ RSI Filters")
+        rsi_min_price  = st.number_input("Min Price ($)",  value=90.0,  step=5.0,  format="%.0f")
+        rsi_avg_vol_k  = st.number_input("Avg Vol (k)",    value=500,   step=100)
+        rsi_curr_vol_k = st.number_input("Curr Vol (k)",   value=1000,  step=100)
+        rsi9_ob        = st.number_input("RSI(9) OB  >",  value=80.0,  step=1.0,  format="%.0f")
+        rsi9_os        = st.number_input("RSI(9) OS  <",  value=20.0,  step=1.0,  format="%.0f")
+        st.markdown("---")
+        scan_btn = st.button("⟳  SCAN RSI", type="primary", use_container_width=True)
+        if st.session_state.rsi_done:
+            st.caption(f"Last: {len(st.session_state.rsi_ob)} OB · {len(st.session_state.rsi_os)} OS")
+
+    elif screen_choice == "Green Line":
+        st.subheader("⚙️ Green Line Filters")
+        gl_min_price = st.number_input("Min Price ($)",  value=10.0,  step=5.0,  format="%.0f")
+        gl_avg_vol_k = st.number_input("Avg Vol (k)",    value=200,   step=100)
+        gl_rs_thr    = st.number_input("IBD-RS >",       value=80.0,  step=1.0,  format="%.0f")
+        st.caption(
+            "Rules:\n"
+            "1. Close > EMA(250)\n"
+            "2. IBD-RS percentile > threshold\n"
+            "3. Stoch(5,1) < 20 and turning up\n\n"
+            "⚠️ Needs 15mo data — runs slower than RSI screen."
+        )
+        st.markdown("---")
+        scan_btn = st.button("⟳  SCAN GREEN LINE", type="primary", use_container_width=True)
+        if st.session_state.gl_done:
+            st.caption(f"Last: {len(st.session_state.gl_results)} results")
+
+    else:  # S&P Movers
+        st.subheader("⚙️ S&P 500 Movers")
+        st.caption(
+            "Top 3 gainers and top 3 losers\n"
+            "by daily % change.\n\n"
+            "Universe: S&P 500 components\n"
+            "Source: Wikipedia + yfinance"
+        )
+        st.markdown("---")
+        scan_btn = st.button("⟳  FETCH MOVERS", type="primary", use_container_width=True)
 
     st.markdown("---")
-    scan_btn = st.button("⟳  SCAN US MARKETS", type="primary", use_container_width=True)
-
-    if st.session_state.scan_done:
-        ob_cnt = len(st.session_state.ob_results)
-        os_cnt = len(st.session_state.os_results)
-        st.caption(f"Last scan: {ob_cnt} overbought · {os_cnt} oversold")
-
-    st.markdown("---")
-    st.caption("NASDAQ · NYSE · AMEX\nDouble-click row → Yahoo chart")
+    st.caption("NASDAQ · NYSE · AMEX\nClick row to chart · Double-click → Yahoo")
 
 
 # ══════════════════════════════════════════════════════════════════
-#  MAIN TABS
+#  TABS
 # ══════════════════════════════════════════════════════════════════
 
-tab_screen, tab_calc, tab_guide = st.tabs([
-    "📊  Screener",
+tab_rsi, tab_gl, tab_sp, tab_calc, tab_guide = st.tabs([
+    "📊  RSI Screen",
+    "🟢  Green Line",
+    "🏆  S&P Movers",
     "🧮  Calculator",
     "📖  Pattern Guide",
 ])
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TAB 1 — SCREENER
+#  TAB 1 — RSI SCREEN
 # ══════════════════════════════════════════════════════════════════
 
-with tab_screen:
-    # ── Run scan ───────────────────────────────────────────────
-    if scan_btn:
-        avg_vol  = int(avg_vol_k  * 1_000)
-        curr_vol = int(curr_vol_k * 1_000)
+with tab_rsi:
+    if scan_btn and screen_choice == "RSI Screen":
+        avg_vol  = int(rsi_avg_vol_k  * 1_000)
+        curr_vol = int(rsi_curr_vol_k * 1_000)
+        prog = st.progress(0, text="Fetching ticker universe…")
 
-        prog_bar = st.progress(0, text="Fetching ticker universe…")
-        status   = st.empty()
-
-        def _cb(pct: int, msg: str):
-            prog_bar.progress(pct / 100, text=msg)
+        def _rsi_cb(pct, msg):
+            prog.progress(pct / 100, text=msg)
 
         try:
-            tickers = fetch_us_universe(min_price)
-            prog_bar.progress(0.05, text=f"{len(tickers)} candidates → downloading OHLCV…")
-
-            ob, os_, cache = screen(
-                tickers, min_price, avg_vol, curr_vol,
-                rsi9_ob, rsi9_os, progress_cb=_cb,
+            tickers = fetch_us_universe(rsi_min_price)
+            prog.progress(0.05, text=f"{len(tickers)} candidates → downloading…")
+            ob, os_, cache = screen_rsi(
+                tickers, rsi_min_price, avg_vol, curr_vol,
+                rsi9_ob, rsi9_os, progress_cb=_rsi_cb,
             )
-            st.session_state.ob_results = ob
-            st.session_state.os_results = os_
-            st.session_state.hist_cache = cache
-            st.session_state.scan_done  = True
-            prog_bar.empty()
-            status.empty()
+            st.session_state.rsi_ob    = ob
+            st.session_state.rsi_os    = os_
+            st.session_state.rsi_cache = cache
+            st.session_state.rsi_done  = True
+            prog.empty()
         except Exception as e:
-            prog_bar.empty()
-            st.error(f"Scan failed: {e}")
+            prog.empty(); st.error(f"Scan failed: {e}")
 
-    # ── Results ────────────────────────────────────────────────
-    if st.session_state.scan_done:
-        ob  = st.session_state.ob_results
-        os_ = st.session_state.os_results
+    if st.session_state.rsi_done:
+        ob  = st.session_state.rsi_ob
+        os_ = st.session_state.rsi_os
 
-        # CSV export
         if ob or os_:
             all_rows = (
-                [{**{c: r[c] for c in DCOLS_DISPLAY}, "List": "Overbought"} for r in ob] +
-                [{**{c: r[c] for c in DCOLS_DISPLAY}, "List": "Oversold"}   for r in os_]
+                [{**{c: r[c] for c in RSI_COLS}, "List":"Overbought"} for r in ob] +
+                [{**{c: r[c] for c in RSI_COLS}, "List":"Oversold"}   for r in os_]
             )
             csv_buf = io.StringIO()
-            df_csv  = pd.DataFrame(all_rows)
-            df_csv.to_csv(csv_buf, index=False)
-            st.download_button(
-                "⬇  Export CSV",
-                data=csv_buf.getvalue(),
-                file_name=f"screener_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-            )
+            pd.DataFrame(all_rows).to_csv(csv_buf, index=False)
+            st.download_button("⬇  Export CSV", data=csv_buf.getvalue(),
+                               file_name=f"rsi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                               mime="text/csv")
 
         ob_tab, os_tab = st.tabs([
             f"🔴  Overbought  ({len(ob)})",
             f"🟢  Oversold    ({len(os_)})",
         ])
 
-        def _show_tab(rows, key_prefix):
+        def _rsi_tab(rows, key):
             if not rows:
                 st.info("No results matching current filters.")
                 return
-            df = (pd.DataFrame(rows)[DCOLS_DISPLAY]
-                    .rename(columns=COL_RENAME))
-            event = st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True,
-                selection_mode="single-row",
-                on_select="rerun",
-                height=min(400, 36 * len(rows) + 38),
-                key=f"tbl_{key_prefix}",
-            )
-            if event.selection.rows:
-                idx     = event.selection.rows[0]
+            df = pd.DataFrame(rows)[RSI_COLS].rename(columns=RSI_RENAME)
+            ev = st.dataframe(df, use_container_width=True, hide_index=True,
+                              selection_mode="single-row", on_select="rerun",
+                              height=min(400, 36*len(rows)+38), key=f"rsi_{key}")
+            if ev.selection.rows:
+                idx     = ev.selection.rows[0]
                 ticker  = rows[idx]["Ticker"]
                 pattern = rows[idx]["Pattern"]
-                hist    = st.session_state.hist_cache.get(ticker)
+                hist    = st.session_state.rsi_cache.get(ticker)
                 if hist is not None:
-                    fig = make_chart(ticker, hist, pattern, rsi9_ob, rsi9_os)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(make_chart(ticker, hist, pattern, rsi9_ob, rsi9_os),
+                                    use_container_width=True)
                     if pattern != "—":
-                        st.markdown("**Pattern details**")
                         for p in [x.strip() for x in pattern.split(",")]:
                             entry = PATTERN_DESCRIPTIONS.get(p)
                             if entry:
-                                label, body = entry
-                                with st.expander(f"▸ {p}  —  {label}"):
-                                    st.write(body)
+                                with st.expander(f"▸ {p}  —  {entry[0]}"):
+                                    st.write(entry[1])
 
-        with ob_tab:
-            _show_tab(ob, "ob")
-        with os_tab:
-            _show_tab(os_, "os")
-
+        with ob_tab: _rsi_tab(ob, "ob")
+        with os_tab: _rsi_tab(os_, "os")
     else:
-        st.info("Configure filters in the sidebar and click **⟳ SCAN US MARKETS** to begin.")
+        st.info("Select **RSI Screen** in the sidebar and click **⟳ SCAN RSI**.")
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TAB 2 — CALCULATOR
+#  TAB 2 — GREEN LINE
+# ══════════════════════════════════════════════════════════════════
+
+with tab_gl:
+    if scan_btn and screen_choice == "Green Line":
+        avg_vol = int(gl_avg_vol_k * 1_000)
+        prog = st.progress(0, text="Fetching ticker universe…")
+
+        def _gl_cb(pct, msg):
+            prog.progress(pct / 100, text=msg)
+
+        try:
+            tickers = fetch_us_universe(gl_min_price)
+            prog.progress(0.03, text=f"{len(tickers)} candidates → downloading 15mo data…")
+            results, cache = screen_green_line(
+                tickers, gl_min_price, avg_vol, gl_rs_thr,
+                progress_cb=_gl_cb,
+            )
+            st.session_state.gl_results = results
+            st.session_state.gl_cache   = cache
+            st.session_state.gl_done    = True
+            prog.empty()
+        except Exception as e:
+            prog.empty(); st.error(f"Scan failed: {e}")
+
+    if st.session_state.gl_done:
+        results = st.session_state.gl_results
+        st.caption(
+            "⚠️ IBD-RS is approximated as 12-month price return percentile within "
+            "this scan universe — not identical to SCTR. Expect some divergence from "
+            "StockCharts rankings."
+        )
+
+        if results:
+            csv_buf = io.StringIO()
+            pd.DataFrame(results)[GL_COLS].to_csv(csv_buf, index=False)
+            st.download_button("⬇  Export CSV", data=csv_buf.getvalue(),
+                               file_name=f"greenline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                               mime="text/csv")
+
+            df = pd.DataFrame(results)[GL_COLS].rename(columns=GL_RENAME)
+            ev = st.dataframe(df, use_container_width=True, hide_index=True,
+                              selection_mode="single-row", on_select="rerun",
+                              height=min(500, 36*len(results)+38), key="gl_tbl")
+            if ev.selection.rows:
+                idx    = ev.selection.rows[0]
+                ticker = results[idx]["Ticker"]
+                hist   = st.session_state.gl_cache.get(ticker)
+                if hist is not None:
+                    st.plotly_chart(make_gl_chart(ticker, hist), use_container_width=True)
+        else:
+            st.info(
+                "No stocks matched all three Green Line rules simultaneously.\n\n"
+                "This is normal — the setup is rare by design. Try lowering the "
+                "IBD-RS threshold or min price filter."
+            )
+    else:
+        st.info("Select **Green Line** in the sidebar and click **⟳ SCAN GREEN LINE**.")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TAB 3 — S&P 500 MOVERS
+# ══════════════════════════════════════════════════════════════════
+
+with tab_sp:
+    if scan_btn and screen_choice == "S&P 500 Movers":
+        prog = st.progress(0, text="Fetching S&P 500 components…")
+
+        def _sp_cb(pct, msg):
+            prog.progress(pct / 100, text=msg)
+
+        try:
+            results = screen_sp500_movers(progress_cb=_sp_cb)
+            st.session_state.sp_results = results
+            st.session_state.sp_done    = True
+            prog.empty()
+        except Exception as e:
+            prog.empty(); st.error(f"Failed: {e}")
+
+    if st.session_state.sp_done:
+        import yfinance as yf
+        results = st.session_state.sp_results
+        gainers = [r for r in results if r["Side"] == "Gainer"]
+        losers  = [r for r in results if r["Side"] == "Loser"]
+
+        if "sp_chart_ticker" not in st.session_state:
+            st.session_state.sp_chart_ticker = None
+
+        g_col, l_col = st.columns(2)
+
+        with g_col:
+            st.markdown("### 🟢 Top Gainers")
+            for r in gainers:
+                st.markdown(
+                    f"<div class='metric-box metric-green'>"
+                    f"<b style='font-size:1.1rem'>{r['Ticker']}</b>&nbsp;&nbsp;"
+                    f"<span style='color:#3fb950;font-size:1.2rem;font-weight:700'>{r['Change']}</span><br>"
+                    f"<span style='color:#6e7f96;font-size:0.85rem'>"
+                    f"Price {r['Price']} &nbsp;·&nbsp; Vol {r['Volume']}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                if st.button(f"Chart {r['Ticker']}", key=f"gc_{r['Ticker']}"):
+                    st.session_state.sp_chart_ticker = r["Ticker"]
+
+        with l_col:
+            st.markdown("### 🔴 Top Losers")
+            for r in losers:
+                st.markdown(
+                    f"<div class='metric-box metric-red'>"
+                    f"<b style='font-size:1.1rem'>{r['Ticker']}</b>&nbsp;&nbsp;"
+                    f"<span style='color:#f85149;font-size:1.2rem;font-weight:700'>{r['Change']}</span><br>"
+                    f"<span style='color:#6e7f96;font-size:0.85rem'>"
+                    f"Price {r['Price']} &nbsp;·&nbsp; Vol {r['Volume']}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                if st.button(f"Chart {r['Ticker']}", key=f"lc_{r['Ticker']}"):
+                    st.session_state.sp_chart_ticker = r["Ticker"]
+
+        selected = st.session_state.sp_chart_ticker
+        if selected:
+            st.markdown("---")
+            with st.spinner(f"Loading {selected}…"):
+                raw = yf.download(selected, period="4mo", interval="1d",
+                                  auto_adjust=True, progress=False)
+                sub = _extract_hist(raw, selected, True)
+                if sub is not None and not sub.empty:
+                    st.plotly_chart(make_chart(selected, sub, "—"),
+                                    use_container_width=True)
+    else:
+        st.info("Select **S&P 500 Movers** in the sidebar and click **⟳ FETCH MOVERS**.")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TAB 4 — CALCULATOR
 # ══════════════════════════════════════════════════════════════════
 
 with tab_calc:
@@ -911,31 +1330,25 @@ with tab_calc:
     if not HAS_XL:
         st.error("openpyxl is not installed. Add it to requirements.txt.")
     else:
-        src_choice = st.radio(
-            "Data Source",
-            ["Yahoo Finance  (stocks, ETFs)", "Twelve Data  (FX & spot metals)"],
-            horizontal=True,
-        )
+        src_choice    = st.radio("Data Source",
+                                 ["Yahoo Finance  (stocks, ETFs)",
+                                  "Twelve Data  (FX & spot metals)"],
+                                 horizontal=True)
         is_twelvedata = src_choice.startswith("Twelve Data")
 
         td_api_key = ""
         if is_twelvedata:
-            # Pull from Streamlit Secrets if configured, else session state, else blank
-            secret_key = st.secrets.get("TWELVEDATA_API_KEY", "")
+            secret_key  = st.secrets.get("TWELVEDATA_API_KEY", "")
             default_key = st.session_state.get("td_api_key", secret_key)
-
-            td_api_key = st.text_input(
-                "Twelve Data API Key",
-                value=default_key,
-                type="password",
+            td_api_key  = st.text_input(
+                "Twelve Data API Key", value=default_key, type="password",
                 help="Stored in Secrets by default — override here for this session only.",
             )
             st.session_state["td_api_key"] = td_api_key
-
             if secret_key and td_api_key == secret_key:
                 st.caption("🔑 Using key from Streamlit Secrets")
             st.caption(
-                "Examples: **XAU/USD** (gold spot) · **XAG/USD** (silver spot) · "
+                "Examples: **XAU/USD** (gold spot) · **XAG/USD** (silver) · "
                 "**EUR/USD** · **GBP/JPY**"
             )
 
@@ -946,27 +1359,20 @@ with tab_calc:
             calc_ticker = st.text_input("Ticker Symbol", value=default_tk).upper().strip()
             calc_period = st.number_input(
                 "RSI Period" if calc_mode == "RSI" else "Rolling Window",
-                value=9 if calc_mode == "RSI" else 20, min_value=2
+                value=9 if calc_mode == "RSI" else 20, min_value=2,
             )
         with c2:
             calc_interval = st.selectbox("Data Interval",
-                                         ["Daily", "Weekly", "Monthly", "Annually"])
-            today         = datetime.today()
-            calc_start = st.date_input(
-                "Start Date",
-                value=today - timedelta(days=730),
-                min_value=datetime(1900, 1, 1),
-                max_value=today,
-                format="YYYY-MM-DD",
-                help="Type any year e.g. 1990-01-01",
-            )
-            calc_end = st.date_input(
-                "End Date",
-                value=today,
-                min_value=datetime(1900, 1, 1),
-                max_value=today,
-                format="YYYY-MM-DD",
-            )
+                                         ["Daily","Weekly","Monthly","Annually"])
+            today = datetime.today()
+            calc_start = st.date_input("Start Date",
+                                       value=today - timedelta(days=730),
+                                       min_value=datetime(1900, 1, 1),
+                                       max_value=today, format="YYYY-MM-DD",
+                                       help="Type any year e.g. 1990-01-01")
+            calc_end   = st.date_input("End Date", value=today,
+                                       min_value=datetime(1900, 1, 1),
+                                       max_value=today, format="YYYY-MM-DD")
 
         if st.button("⬇  Download & Build Excel", type="primary"):
             if not calc_ticker:
@@ -979,8 +1385,7 @@ with tab_calc:
                         iv_map = {"Daily":"1d","Weekly":"1wk","Monthly":"1mo","Annually":"1y"}
                         sf_map = {"Daily":"","Weekly":"_Weekly","Monthly":"_Monthly","Annually":"_Annual"}
                         df_ohlc = download_ohlc(
-                            calc_ticker,
-                            str(calc_start), str(calc_end),
+                            calc_ticker, str(calc_start), str(calc_end),
                             iv_map[calc_interval],
                             source="twelvedata" if is_twelvedata else "yahoo",
                             api_key=td_api_key,
@@ -996,9 +1401,7 @@ with tab_calc:
                         buf.seek(0)
                         st.success(f"✓  Built {len(df_ohlc)} rows of {calc_interval.lower()} data")
                         st.download_button(
-                            label=f"📂  Save {fname}",
-                            data=buf,
-                            file_name=fname,
+                            label=f"📂  Save {fname}", data=buf, file_name=fname,
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
                     except Exception as e:
@@ -1006,14 +1409,13 @@ with tab_calc:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TAB 3 — PATTERN GUIDE
+#  TAB 5 — PATTERN GUIDE
 # ══════════════════════════════════════════════════════════════════
 
 with tab_guide:
     st.subheader("Chart Pattern Reference")
     st.caption("All patterns are heuristic — treat as a first-pass filter, not a signal.")
     st.markdown("---")
-
     for pattern, (label, body) in PATTERN_DESCRIPTIONS.items():
         with st.expander(f"▸  {pattern}  —  {label}"):
             st.write(body)
