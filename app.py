@@ -1034,6 +1034,12 @@ GL_COLS     = ["Ticker","Price","AvgVol","EMA250","PctAboveEMA","RS","Stoch"]
 GL_RENAME   = {"AvgVol":"Avg Vol","EMA250":"EMA(250)","PctAboveEMA":"% > EMA","RS":"IBD-RS","Stoch":"Stoch(5,1)"}
 SP_COLS     = ["Ticker","Price","Change","Volume","Side"]
 
+# Filter defaults — always defined so tabs never get a NameError
+# regardless of which screen is active in the sidebar
+rsi9_ob    = 80.0
+rsi9_os    = 20.0
+gl_rs_thr  = 80.0
+
 
 # ══════════════════════════════════════════════════════════════════
 #  SIDEBAR
