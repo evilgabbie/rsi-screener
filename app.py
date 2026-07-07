@@ -1160,16 +1160,18 @@ with tab_rsi:
                 st.info("No results matching current filters.")
                 return
             df = pd.DataFrame(rows)[RSI_COLS].rename(columns=RSI_RENAME)
-            ev = st.dataframe(df, use_container_width=True, hide_index=True,
-                              selection_mode="single-row", on_select="rerun",
-                              height=min(400, 36*len(rows)+38), key=f"rsi_{key}")
-            if ev.selection.rows:
-                idx     = ev.selection.rows[0]
-                ticker  = rows[idx]["Ticker"]
-                pattern = rows[idx]["Pattern"]
-                hist    = st.session_state.rsi_cache.get(ticker)
+            st.dataframe(df, use_container_width=True, hide_index=True,
+                         height=min(400, 36*len(rows)+38))
+            ticker_list = [r["Ticker"] for r in rows]
+            sel = st.selectbox("Select ticker to chart",
+                               options=["— select —"] + ticker_list,
+                               key=f"rsi_sel_{key}")
+            if sel and sel != "— select —":
+                row     = next(r for r in rows if r["Ticker"] == sel)
+                pattern = row["Pattern"]
+                hist    = st.session_state.rsi_cache.get(sel)
                 if hist is not None:
-                    st.plotly_chart(make_chart(ticker, hist, pattern, rsi9_ob, rsi9_os),
+                    st.plotly_chart(make_chart(sel, hist, pattern, rsi9_ob, rsi9_os),
                                     use_container_width=True)
                     if pattern != "—":
                         for p in [x.strip() for x in pattern.split(",")]:
@@ -1226,15 +1228,16 @@ with tab_gl:
                                mime="text/csv")
 
             df = pd.DataFrame(results)[GL_COLS].rename(columns=GL_RENAME)
-            ev = st.dataframe(df, use_container_width=True, hide_index=True,
-                              selection_mode="single-row", on_select="rerun",
-                              height=min(500, 36*len(results)+38), key="gl_tbl")
-            if ev.selection.rows:
-                idx    = ev.selection.rows[0]
-                ticker = results[idx]["Ticker"]
-                hist   = st.session_state.gl_cache.get(ticker)
+            st.dataframe(df, use_container_width=True, hide_index=True,
+                         height=min(500, 36*len(results)+38))
+            ticker_list = [r["Ticker"] for r in results]
+            sel = st.selectbox("Select ticker to chart",
+                               options=["— select —"] + ticker_list,
+                               key="gl_sel")
+            if sel and sel != "— select —":
+                hist = st.session_state.gl_cache.get(sel)
                 if hist is not None:
-                    st.plotly_chart(make_gl_chart(ticker, hist), use_container_width=True)
+                    st.plotly_chart(make_gl_chart(sel, hist), use_container_width=True)
         else:
             st.info(
                 "No stocks matched all three Green Line rules simultaneously.\n\n"
