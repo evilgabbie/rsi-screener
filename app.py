@@ -426,6 +426,7 @@ def screen_rsi(
 
 def screen_green_line(
     tickers, min_price, min_avg_vol, rs_threshold,
+    stoch_mode="Stoch < 20 turning up  (oversold / buy)",
     progress_cb=None,
 ) -> tuple[list[dict], dict]:
     """
@@ -438,8 +439,10 @@ def screen_green_line(
     the scan universe. Not identical to SCTR — peer ranking is
     the unresolvable gap without a StockCharts API subscription.
 
-    Slow Stochastic trigger: loose — %K < 20 AND today > yesterday
-    (entry while still in green zone, matching the chart examples).
+    stoch_mode controls Rule 3:
+      "Stoch < 20 turning up"  — oversold bounce (buy setup)
+      "Stoch > 80 turning down" — overbought rollover (short setup)
+      "Either"                  — both conditions
     """
     import yfinance as yf
 
@@ -521,14 +524,26 @@ def screen_green_line(
         if rs < rs_threshold:
             continue
 
-        # Rule 3 — Slow Stochastic(5,1) < 20 AND turning up
+        # Rule 3 — Stochastic per stoch_mode
         k_curr, k_prev = slow_stochastic(hist, k_period=5)
         if np.isnan(k_curr) or np.isnan(k_prev):
             continue
-        if k_curr >= 20 or k_curr <= k_prev:
+
+        os_signal = k_curr < 20 and k_curr > k_prev   # oversold turning up
+        ob_signal = k_curr > 80 and k_curr < k_prev   # overbought turning down
+
+        if "Either" in stoch_mode:
+            passes = os_signal or ob_signal
+        elif "20" in stoch_mode:   # < 20 turning up
+            passes = os_signal
+        else:                       # > 80 turning down
+            passes = ob_signal
+
+        if not passes:
             continue
 
         pct_above_ema = (price - ema250[-1]) / ema250[-1] * 100
+        stoch_dir = "↑" if k_curr > k_prev else "↓"
         results.append(dict(
             Ticker        = t,
             Price         = f"${price:.2f}",
@@ -536,7 +551,7 @@ def screen_green_line(
             EMA250        = f"${ema250[-1]:.2f}",
             PctAboveEMA   = f"{pct_above_ema:.1f}%",
             RS            = f"{rs:.0f}",
-            Stoch         = f"{k_curr:.1f}",
+            Stoch         = f"{k_curr:.1f} {stoch_dir}",
             _rs           = rs,
         ))
 
@@ -565,8 +580,10 @@ def fetch_sp500_tickers() -> list[str]:
 
 def screen_sp500_movers(progress_cb=None) -> list[dict]:
     """
-    Pulls 2 days of daily OHLCV for all S&P 500 components,
-    computes daily % change, returns top 3 + bottom 3.
+    Downloads 5 days of OHLCV for all S&P 500 components in ONE call.
+    Uses default yfinance layout (no group_by) which gives a stable
+    (Price, Ticker) MultiIndex — raw["Close"]["AAPL"] always works.
+    Returns top 3 gainers + top 3 losers by daily % change.
     """
     import yfinance as yf
 
@@ -575,66 +592,81 @@ def screen_sp500_movers(progress_cb=None) -> list[dict]:
         return []
 
     if progress_cb:
-        progress_cb(10, f"Fetching {len(tickers)} S&P 500 components…")
+        progress_cb(5, f"Fetching {len(tickers)} S&P 500 components…")
 
-    BATCH = 50
+    try:
+        # Single download call — no group_by, stable (Price, Ticker) layout
+        raw = yf.download(
+            tickers  = tickers,
+            period   = "5d",
+            interval = "1d",
+            auto_adjust = True,
+            progress = False,
+            threads  = True,
+        )
+    except Exception as e:
+        return []
+
+    if raw.empty:
+        return []
+
+    if progress_cb:
+        progress_cb(80, "Computing daily % change…")
+
+    # Extract Close and Volume sub-frames
+    try:
+        if isinstance(raw.columns, pd.MultiIndex):
+            closes  = raw["Close"]   # DataFrame: rows=dates, cols=tickers
+            volumes = raw["Volume"]
+        else:
+            # Single ticker fallback (shouldn't happen with 500 tickers)
+            return []
+    except KeyError:
+        return []
+
+    # Need at least 2 rows for % change
+    closes  = closes.dropna(how="all")
+    volumes = volumes.dropna(how="all")
+    if len(closes) < 2:
+        return []
+
     results = []
+    prev_row = closes.iloc[-2]
+    curr_row = closes.iloc[-1]
+    vol_row  = volumes.iloc[-1]
 
-    for i in range(0, len(tickers), BATCH):
-        batch = tickers[i: i + BATCH]
-        if progress_cb:
-            progress_cb(
-                10 + int(i / len(tickers) * 80),
-                f"Downloading batch {i // BATCH + 1} / {-(-len(tickers) // BATCH)}"
-            )
+    for t in tickers:
         try:
-            raw = yf.download(tickers=batch, period="5d", interval="1d",
-                              auto_adjust=True, progress=False, group_by="ticker")
-            if raw.empty:
+            prev = float(prev_row.get(t, float("nan")))
+            curr = float(curr_row.get(t, float("nan")))
+            vol  = float(vol_row.get(t,  0))
+            if (prev != prev) or (curr != curr) or prev <= 0:  # nan check
                 continue
-
-            single = len(batch) == 1
-            for t in batch:
-                try:
-                    sub = _extract_hist(raw, t, single)
-                    if sub is None or len(sub) < 2:
-                        continue
-                    closes = sub["Close"].dropna().values.astype(float)
-                    if len(closes) < 2:
-                        continue
-                    prev_close, curr_close = closes[-2], closes[-1]
-                    if prev_close <= 0:
-                        continue
-                    pct = (curr_close - prev_close) / prev_close * 100
-                    vol = float(sub["Volume"].values[-1]) if "Volume" in sub.columns else 0
-                    results.append(dict(
-                        Ticker=t, Price=f"${curr_close:.2f}",
-                        Change=f"{pct:+.2f}%", Volume=f"{vol:,.0f}", _pct=pct,
-                    ))
-                except Exception:
-                    pass
-                    pass
+            pct = (curr - prev) / prev * 100
+            results.append(dict(
+                Ticker = t,
+                Price  = f"${curr:.2f}",
+                Change = f"{pct:+.2f}%",
+                Volume = f"{vol:,.0f}",
+                _pct   = pct,
+            ))
         except Exception:
-            pass
-        time.sleep(0.2)
+            continue
 
     if not results:
         return []
 
     results.sort(key=lambda r: r["_pct"], reverse=True)
     gainers = results[:3]
-    losers  = results[-3:][::-1]   # worst first
-
-    # Tag each row
+    losers  = results[-3:][::-1]
     for r in gainers: r["Side"] = "Gainer"
     for r in losers:  r["Side"] = "Loser"
 
+    if progress_cb:
+        progress_cb(100, f"Done — {len(results)} tickers processed")
+
     return gainers + losers
 
-
-# ══════════════════════════════════════════════════════════════════
-#  PLOTLY CHART
-# ══════════════════════════════════════════════════════════════════
 
 def make_chart(ticker: str, hist: pd.DataFrame, pattern: str,
                ob_thr: float = 80, os_thr: float = 20) -> go.Figure:
@@ -1036,9 +1068,10 @@ SP_COLS     = ["Ticker","Price","Change","Volume","Side"]
 
 # Filter defaults — always defined so tabs never get a NameError
 # regardless of which screen is active in the sidebar
-rsi9_ob    = 80.0
-rsi9_os    = 20.0
-gl_rs_thr  = 80.0
+rsi9_ob      = 80.0
+rsi9_os      = 20.0
+gl_rs_thr    = 80.0
+gl_stoch_mode = "Stoch < 20 turning up  (oversold / buy)"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1070,14 +1103,21 @@ with st.sidebar:
 
     elif screen_choice == "Green Line":
         st.subheader("⚙️ Green Line Filters")
-        gl_min_price = st.number_input("Min Price ($)",  value=10.0,  step=5.0,  format="%.0f")
-        gl_avg_vol_k = st.number_input("Avg Vol (k)",    value=200,   step=100)
+        gl_min_price = st.number_input("Min Price ($)",  value=100.0, step=5.0,  format="%.0f")
+        gl_avg_vol_k = st.number_input("Avg Vol (k)",    value=600,   step=100)
         gl_rs_thr    = st.number_input("IBD-RS >",       value=80.0,  step=1.0,  format="%.0f")
+        gl_stoch_mode = st.radio(
+            "Stochastic Signal",
+            ["Stoch < 20 turning up  (oversold / buy)",
+             "Stoch > 80 turning down  (overbought / short)",
+             "Either"],
+            index=0,
+        )
         st.caption(
             "Rules:\n"
             "1. Close > EMA(250)\n"
             "2. IBD-RS percentile > threshold\n"
-            "3. Stoch(5,1) < 20 and turning up\n\n"
+            "3. Stochastic per selection above\n\n"
             "⚠️ Needs 15mo data — runs slower than RSI screen."
         )
         st.markdown("---")
@@ -1209,6 +1249,7 @@ with tab_gl:
             prog.progress(0.03, text=f"{len(tickers)} candidates → downloading 15mo data…")
             results, cache = screen_green_line(
                 tickers, gl_min_price, avg_vol, gl_rs_thr,
+                stoch_mode=gl_stoch_mode,
                 progress_cb=_gl_cb,
             )
             st.session_state.gl_results = results
@@ -1278,6 +1319,12 @@ with tab_sp:
         results = st.session_state.sp_results
         gainers = [r for r in results if r["Side"] == "Gainer"]
         losers  = [r for r in results if r["Side"] == "Loser"]
+
+        if not results:
+            st.warning(
+                "Scan returned no results. This usually means yfinance "
+                "rate-limited the download. Wait 60 seconds and try again."
+            )
 
         if "sp_chart_ticker" not in st.session_state:
             st.session_state.sp_chart_ticker = None
