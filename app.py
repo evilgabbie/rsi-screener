@@ -1086,7 +1086,7 @@ SP_COLS     = ["Ticker","Price","Change","Volume","Side"]
 rsi9_ob       = 80.0
 rsi9_os       = 20.0
 gl_rs_thr     = 80.0
-gl_ema_period = 250
+gl_ema_period = 250      # always defined — sidebar overwrites when GL is active
 gl_mode       = "🟢  Bullish  (buy the dip)"
 gl_stoch_mode = "Stoch < 20 turning up  (oversold / buy)"
 
@@ -1234,18 +1234,27 @@ with tab_rsi:
                 st.info("No results matching current filters.")
                 return
             df = pd.DataFrame(rows)[RSI_COLS].rename(columns=RSI_RENAME)
-            st.dataframe(df, use_container_width=True, hide_index=True,
-                         height=min(400, 36*len(rows)+38))
-            ticker_list = [r["Ticker"] for r in rows]
-            sel = st.selectbox("Select ticker to chart",
-                               options=["— select —"] + ticker_list,
-                               key=f"rsi_sel_{key}")
-            if sel and sel != "— select —":
-                row     = next(r for r in rows if r["Ticker"] == sel)
-                pattern = row["Pattern"]
-                hist    = st.session_state.rsi_cache.get(sel)
+            # Use data hash in key so stale selection state never persists
+            data_hash = str(abs(hash(tuple(r["Ticker"] for r in rows))))[:8]
+            tbl_key   = f"rsi_{key}_{data_hash}"
+            try:
+                ev = st.dataframe(
+                    df, use_container_width=True, hide_index=True,
+                    selection_mode="single-row", on_select="rerun",
+                    height=min(400, 36*len(rows)+38), key=tbl_key,
+                )
+                sel_rows = ev.selection.rows
+            except Exception:
+                st.dataframe(df, use_container_width=True, hide_index=True,
+                             height=min(400, 36*len(rows)+38))
+                sel_rows = []
+            if sel_rows:
+                idx     = sel_rows[0]
+                ticker  = rows[idx]["Ticker"]
+                pattern = rows[idx]["Pattern"]
+                hist    = st.session_state.rsi_cache.get(ticker)
                 if hist is not None:
-                    st.plotly_chart(make_chart(sel, hist, pattern, rsi9_ob, rsi9_os),
+                    st.plotly_chart(make_chart(ticker, hist, pattern, rsi9_ob, rsi9_os),
                                     use_container_width=True)
                     if pattern != "—":
                         for p in [x.strip() for x in pattern.split(",")]:
@@ -1304,16 +1313,25 @@ with tab_gl:
                                mime="text/csv")
 
             df = pd.DataFrame(results)[GL_COLS].rename(columns=GL_RENAME)
-            st.dataframe(df, use_container_width=True, hide_index=True,
-                         height=min(500, 36*len(results)+38))
-            ticker_list = [r["Ticker"] for r in results]
-            sel = st.selectbox("Select ticker to chart",
-                               options=["— select —"] + ticker_list,
-                               key="gl_sel")
-            if sel and sel != "— select —":
-                hist = st.session_state.gl_cache.get(sel)
+            data_hash = str(abs(hash(tuple(r["Ticker"] for r in results))))[:8]
+            tbl_key   = f"gl_{data_hash}"
+            try:
+                ev = st.dataframe(
+                    df, use_container_width=True, hide_index=True,
+                    selection_mode="single-row", on_select="rerun",
+                    height=min(500, 36*len(results)+38), key=tbl_key,
+                )
+                sel_rows = ev.selection.rows
+            except Exception:
+                st.dataframe(df, use_container_width=True, hide_index=True,
+                             height=min(500, 36*len(results)+38))
+                sel_rows = []
+            if sel_rows:
+                ticker = results[sel_rows[0]]["Ticker"]
+                hist   = st.session_state.gl_cache.get(ticker)
                 if hist is not None:
-                    st.plotly_chart(make_gl_chart(sel, hist, ema_period), use_container_width=True)
+                    st.plotly_chart(make_gl_chart(ticker, hist, int(gl_ema_period)),
+                                    use_container_width=True)
         else:
             st.info(
                 "No stocks matched all three Green Line rules simultaneously.\n\n"
@@ -1395,12 +1413,22 @@ with tab_sp:
         if selected:
             st.markdown("---")
             with st.spinner(f"Loading {selected}…"):
-                raw = yf.download(selected, period="4mo", interval="1d",
-                                  auto_adjust=True, progress=False)
-                sub = _extract_hist(raw, selected, True)
-                if sub is not None and not sub.empty:
-                    st.plotly_chart(make_chart(selected, sub, "—"),
-                                    use_container_width=True)
+                try:
+                    raw = yf.download(selected, period="4mo", interval="1d",
+                                      auto_adjust=True, progress=False)
+                    if not raw.empty:
+                        # Flatten MultiIndex if present
+                        if isinstance(raw.columns, pd.MultiIndex):
+                            raw.columns = raw.columns.get_level_values(0)
+                        if "Close" in raw.columns:
+                            st.plotly_chart(make_chart(selected, raw, "—"),
+                                            use_container_width=True)
+                        else:
+                            st.warning(f"Could not load chart data for {selected}.")
+                    else:
+                        st.warning(f"No data returned for {selected}.")
+                except Exception as ex:
+                    st.error(f"Chart error: {ex}")
     else:
         st.info("Select **S&P 500 Movers** in the sidebar and click **⟳ FETCH MOVERS**.")
 
