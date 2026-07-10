@@ -76,6 +76,26 @@ st.markdown("""
         color: #e6edf3;
     }
     [data-testid="stCaptionContainer"] p { color: #6e7f96 !important; }
+
+    /* Calculator + general form label visibility */
+    .stRadio label, .stSelectbox label,
+    .stNumberInput label, .stTextInput label,
+    .stDateInput label { color: #c9d1d9 !important; font-weight: 500; }
+    .stRadio div[role="radiogroup"] label { color: #c9d1d9 !important; }
+    .stSelectbox div[data-baseweb="select"] div { color: #c9d1d9 !important; }
+    .stTextInput input, .stNumberInput input {
+        color: #e6edf3 !important;
+        background-color: #1e2736 !important;
+        border-color: #2d3748 !important;
+    }
+    .stDateInput input {
+        color: #e6edf3 !important;
+        background-color: #1e2736 !important;
+    }
+    div[data-testid="stForm"] { background: transparent; }
+    /* Make subheaders and text visible */
+    .stMarkdown h3 { color: #e6edf3 !important; }
+    p { color: #c9d1d9; }
     .metric-box {
         background: #1a2235;
         border-radius: 10px;
@@ -1272,6 +1292,10 @@ with tab_rsi:
                 if hist is not None:
                     st.plotly_chart(make_chart(ticker, hist, pattern, rsi9_ob, rsi9_os),
                                     use_container_width=True)
+                    st.link_button(
+                        f"🔗 Open {ticker} on Yahoo Finance",
+                        f"https://finance.yahoo.com/chart/{ticker}",
+                    )
                     if pattern != "—":
                         for p in [x.strip() for x in pattern.split(",")]:
                             entry = PATTERN_DESCRIPTIONS.get(p)
@@ -1348,6 +1372,10 @@ with tab_gl:
                 if hist is not None:
                     st.plotly_chart(make_gl_chart(ticker, hist, int(gl_ema_period)),
                                     use_container_width=True)
+                    st.link_button(
+                        f"🔗 Open {ticker} on Yahoo Finance",
+                        f"https://finance.yahoo.com/chart/{ticker}",
+                    )
         else:
             st.info(
                 "No stocks matched all three Green Line rules simultaneously.\n\n"
@@ -1449,6 +1477,10 @@ with tab_sp:
                         if "Close" in raw.columns:
                             st.plotly_chart(make_chart(selected, raw, "—"),
                                             use_container_width=True)
+                            st.link_button(
+                                f"🔗 Open {selected} on Yahoo Finance",
+                                f"https://finance.yahoo.com/chart/{selected}",
+                            )
                         else:
                             st.warning(f"Could not load chart data for {selected}.")
                     else:
