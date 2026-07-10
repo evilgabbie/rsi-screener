@@ -720,56 +720,130 @@ def screen_sp500_movers(progress_cb=None) -> tuple[list[dict], str]:
 
 def make_chart(ticker: str, hist: pd.DataFrame, pattern: str,
                ob_thr: float = 80, os_thr: float = 20) -> go.Figure:
-    c  = hist["Close"].values.astype(float)
-    v  = hist["Volume"].values.astype(float)
+    """
+    Two-panel RSI chart:
+      Top   (25%) — Close price line for price context
+      Bottom (75%) — RSI(9) for Open / High / Low / Close as 4 coloured lines
+                     Zones: 90-100 deep red, 80-90 light red,
+                            10-20 light green, 0-10 deep green
+    """
     dt = hist.index
-    rs = rsi_series(c, 9)
 
-    bar_colors = ["#3fb950" if i == 0 or c[i] >= c[i - 1] else "#f85149"
-                  for i in range(len(c))]
+    # ── Compute RSI(9) for all four series ─────────────────────────────────
+    series = {}
+    colors = {
+        "Open":  "#888888",   # grey
+        "High":  "#3fb950",   # green
+        "Low":   "#f85149",   # red
+        "Close": "#f0b429",   # amber — main series, most emphasis
+    }
+    for name in ["Open", "High", "Low", "Close"]:
+        if name in hist.columns:
+            arr = hist[name].values.astype(float)
+            series[name] = rsi_series(arr, 9)
+
+    c  = hist["Close"].values.astype(float)
+    v  = hist["Volume"].values.astype(float) if "Volume" in hist.columns else np.zeros(len(c))
 
     fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True,
-        row_heights=[0.58, 0.16, 0.26], vertical_spacing=0.03,
-        subplot_titles=[f"<b>{ticker}</b>  —  {pattern}", "Volume", "RSI(9)"],
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.22, 0.78],
+        vertical_spacing=0.04,
+        subplot_titles=[
+            f"<b>{ticker}</b>  —  {pattern}",
+            "RSI(9)  ·  Open  High  Low  Close",
+        ],
     )
+
+    # ── Panel 1: Close price ────────────────────────────────────────────────
     fig.add_trace(go.Scatter(
-        x=dt, y=c, fill="tozeroy", fillcolor="rgba(63,185,80,0.08)",
-        line=dict(color="#3fb950", width=1.5), name="Close",
-        hovertemplate="$%{y:.2f}<extra></extra>",
+        x=dt, y=c,
+        line=dict(color="#f0b429", width=1.2),
+        fill="tozeroy",
+        fillcolor="rgba(240,180,41,0.06)",
+        name="Close",
+        hovertemplate="$%{y:.2f}<extra>Close</extra>",
     ), row=1, col=1)
-    fig.add_trace(go.Bar(
-        x=dt, y=v, marker_color=bar_colors, opacity=0.6, name="Volume",
-        hovertemplate="%{y:,.0f}<extra></extra>",
-    ), row=2, col=1)
-    fig.add_hrect(y0=ob_thr, y1=100, fillcolor="rgba(248,81,73,0.08)",
-                  line_width=0, row=3, col=1)
-    fig.add_hrect(y0=0, y1=os_thr, fillcolor="rgba(63,185,80,0.08)",
-                  line_width=0, row=3, col=1)
-    fig.add_hline(y=ob_thr, line_dash="dash", line_color="#f85149",
-                  line_width=1, opacity=0.7, row=3, col=1)
-    fig.add_hline(y=os_thr, line_dash="dash", line_color="#3fb950",
-                  line_width=1, opacity=0.7, row=3, col=1)
-    fig.add_trace(go.Scatter(
-        x=dt, y=rs, line=dict(color="#f0b429", width=1.3), name="RSI(9)",
-        hovertemplate="RSI %{y:.1f}<extra></extra>",
-    ), row=3, col=1)
-    rsi_last = rs[~np.isnan(rs)][-1] if np.any(~np.isnan(rs)) else float("nan")
+
+    # ── Panel 2: RSI zones ─────────────────────────────────────────────────
+    # Strong zones (90-100, 0-10)
+    fig.add_hrect(y0=90, y1=100,
+                  fillcolor="rgba(248,81,73,0.18)", line_width=0, row=2, col=1)
+    fig.add_hrect(y0=0,  y1=10,
+                  fillcolor="rgba(63,185,80,0.18)",  line_width=0, row=2, col=1)
+    # Mild zones (80-90, 10-20)
+    fig.add_hrect(y0=80, y1=90,
+                  fillcolor="rgba(248,81,73,0.07)", line_width=0, row=2, col=1)
+    fig.add_hrect(y0=10, y1=20,
+                  fillcolor="rgba(63,185,80,0.07)",  line_width=0, row=2, col=1)
+
+    # Threshold lines
+    for y, color, dash in [
+        (90, "#f85149", "dot"),
+        (80, "#f85149", "dash"),
+        (50, "#3d4f63",  "dot"),
+        (20, "#3fb950",  "dash"),
+        (10, "#3fb950",  "dot"),
+    ]:
+        fig.add_hline(y=y, line_dash=dash, line_color=color,
+                      line_width=1.0, opacity=0.7, row=2, col=1)
+
+    # ── RSI lines — draw Open/High/Low first, Close on top ─────────────────
+    draw_order = ["Open", "High", "Low", "Close"]
+    widths = {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 2.0}
+    for name in draw_order:
+        if name not in series:
+            continue
+        rs  = series[name]
+        col = colors[name]
+        fig.add_trace(go.Scatter(
+            x=dt, y=rs,
+            line=dict(color=col, width=widths[name]),
+            name=f"RSI ({name})",
+            hovertemplate=f"RSI {name}: %{{y:.1f}}<extra></extra>",
+        ), row=2, col=1)
+
+    # ── Current RSI(Close) label ────────────────────────────────────────────
+    rsi_close = series.get("Close", np.array([]))
+    valid = rsi_close[~np.isnan(rsi_close)]
+    rsi_now = valid[-1] if len(valid) else float("nan")
+
+    # ── Layout ─────────────────────────────────────────────────────────────
     fig.update_layout(
-        plot_bgcolor="#161b22", paper_bgcolor="#0d1117",
-        font=dict(color="#e6edf3", size=11), height=560,
-        showlegend=False, margin=dict(l=10, r=10, t=40, b=10),
-        hovermode="x unified", hoverlabel=dict(bgcolor="#21262d", font_color="#e6edf3"),
+        plot_bgcolor  = "#161b22",
+        paper_bgcolor = "#0d1117",
+        font          = dict(color="#e6edf3", size=11),
+        height        = 580,
+        showlegend    = True,
+        legend        = dict(
+            orientation="h",
+            yanchor="bottom", y=1.01,
+            xanchor="right",  x=1,
+            bgcolor="#1e2736",
+            bordercolor="#2d3748",
+            font=dict(color="#c9d1d9", size=10),
+        ),
+        margin      = dict(l=10, r=10, t=50, b=10),
+        hovermode   = "x unified",
+        hoverlabel  = dict(bgcolor="#21262d", font_color="#e6edf3"),
     )
-    fig.update_xaxes(gridcolor="#21262d", showgrid=True,
-                     zeroline=False, rangeslider_visible=False)
+    fig.update_xaxes(
+        gridcolor="#21262d", showgrid=True,
+        zeroline=False, rangeslider_visible=False,
+    )
     fig.update_yaxes(gridcolor="#21262d", showgrid=True, zeroline=False)
     fig.update_yaxes(tickprefix="$", row=1, col=1)
-    fig.update_yaxes(range=[0, 100], tickvals=[0, os_thr, 50, ob_thr, 100], row=3, col=1)
-    if not np.isnan(rsi_last):
-        fig.layout.annotations[0].text = (
-            f"<b>{ticker}</b>  RSI {rsi_last:.1f}  —  {pattern}"
-        )
+    fig.update_yaxes(
+        range=[0, 100],
+        tickvals=[0, 10, 20, 50, 80, 90, 100],
+        row=2, col=1,
+    )
+
+    # Update title with live RSI(Close)
+    rsi_label = f"  RSI(Close) {rsi_now:.1f}" if not np.isnan(rsi_now) else ""
+    fig.layout.annotations[0].text = f"<b>{ticker}</b>{rsi_label}  —  {pattern}"
+
     return fig
 
 
