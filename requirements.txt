@@ -5,3 +5,5 @@ numpy
 requests
 plotly
 openpyxl
+lxml
+html5lib

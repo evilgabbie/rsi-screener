@@ -426,20 +426,21 @@ def screen_rsi(
 
 def screen_green_line(
     tickers, min_price, min_avg_vol, rs_threshold,
+    ema_period=250, is_bullish=True,
     progress_cb=None,
 ) -> tuple[list[dict], dict]:
     """
-    Requires 15 months of daily OHLCV per ticker:
-      - EMA(250) needs 250 trading days
-      - IBD-RS needs 252 trading days (12-month return)
-      - Stochastic(5,1) needs 5 days
+    Bullish mode (default):
+      1. Close > EMA(ema_period)
+      2. IBD-RS percentile > rs_threshold
+      3. Stoch(5,1) < 20 AND turning up
 
-    IBD-RS approximation: 12-month price return percentile within
-    the scan universe. Not identical to SCTR — peer ranking is
-    the unresolvable gap without a StockCharts API subscription.
+    Bearish mode (is_bullish=False):
+      1. Close < EMA(ema_period)
+      2. IBD-RS percentile < (100 - rs_threshold)   [bottom of range]
+      3. Stoch(5,1) > 80 AND turning down
 
-    Slow Stochastic trigger: loose — %K < 20 AND today > yesterday
-    (entry while still in green zone, matching the chart examples).
+    IBD-RS = 12-month price return percentile within scan universe.
     """
     import yfinance as yf
 
@@ -511,33 +512,47 @@ def screen_green_line(
         if price < min_price or avg_vol < min_avg_vol:
             continue
 
-        # Rule 1 — above EMA(250)
-        ema250 = ema_series(c, 250)
-        if np.isnan(ema250[-1]) or price <= ema250[-1]:
+        # Rule 1 — price vs EMA(ema_period)
+        ema_vals = ema_series(c, ema_period)
+        if np.isnan(ema_vals[-1]):
+            continue
+        above_ema = price > ema_vals[-1]
+        if is_bullish and not above_ema:
+            continue
+        if not is_bullish and above_ema:
             continue
 
-        # Rule 2 — IBD-RS percentile > threshold
+        # Rule 2 — IBD-RS percentile
         rs = rs_rank.get(t, 0.0)
-        if rs < rs_threshold:
+        if is_bullish and rs < rs_threshold:
+            continue
+        if not is_bullish and rs > (100.0 - rs_threshold):
             continue
 
-        # Rule 3 — Slow Stochastic(5,1) < 20 AND turning up
+        # Rule 3 — Stochastic(5,1)
         k_curr, k_prev = slow_stochastic(hist, k_period=5)
         if np.isnan(k_curr) or np.isnan(k_prev):
             continue
-        if k_curr >= 20 or k_curr <= k_prev:
-            continue
 
-        pct_above_ema = (price - ema250[-1]) / ema250[-1] * 100
+        if is_bullish:
+            if not (k_curr < 20 and k_curr > k_prev):   # oversold, turning up
+                continue
+        else:
+            if not (k_curr > 80 and k_curr < k_prev):   # overbought, turning down
+                continue
+
+        ema_val = ema_vals[-1]
+        pct_from_ema = (price - ema_val) / ema_val * 100
+        stoch_dir = "↑" if k_curr > k_prev else "↓"
         results.append(dict(
-            Ticker        = t,
-            Price         = f"${price:.2f}",
-            AvgVol        = f"{avg_vol:,.0f}",
-            EMA250        = f"${ema250[-1]:.2f}",
-            PctAboveEMA   = f"{pct_above_ema:.1f}%",
-            RS            = f"{rs:.0f}",
-            Stoch         = f"{k_curr:.1f}",
-            _rs           = rs,
+            Ticker      = t,
+            Price       = f"${price:.2f}",
+            AvgVol      = f"{avg_vol:,.0f}",
+            EMA         = f"${ema_val:.2f}",
+            PctFromEMA  = f"{pct_from_ema:+.1f}%",
+            RS          = f"{rs:.0f}",
+            Stoch       = f"{k_curr:.1f} {stoch_dir}",
+            _rs         = rs,
         ))
 
     results.sort(key=lambda r: r["_rs"], reverse=True)
@@ -550,91 +565,122 @@ def screen_green_line(
 #  Universe: S&P 500 components from Wikipedia (stays current)
 # ══════════════════════════════════════════════════════════════════
 
+# Hardcoded S&P 500 fallback — top 100 by market cap
+# Used when Wikipedia fetch fails (rate limit, network, etc.)
+_SP500_FALLBACK = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","TSLA","AVGO",
+    "JPM","LLY","V","UNH","XOM","MA","JNJ","PG","COST","HD","ABBV","MRK","BAC",
+    "NFLX","CRM","CVX","KO","WMT","ORCL","MCD","ACN","PEP","TMO","LIN","ABT",
+    "DHR","NKE","CSCO","DIS","ADBE","AMD","TXN","NEE","INTC","RTX","HON","AMGN",
+    "IBM","COP","QCOM","INTU","UPS","LOW","SBUX","SPGI","PLD","GS","BLK","CAT",
+    "AXP","BA","GE","MDT","SYK","MMC","ISRG","GILD","BKNG","ADI","VRTX","REGN",
+    "CI","ELV","MO","ZTS","TJX","C","WM","SO","DUK","AON","CB","MDLZ","BSX",
+    "HUM","CME","ITW","PNC","USB","MMM","ETN","SHW","CL","ICE","NOC","MCO",
+    "APD","ECL","EMR","FIS","NSC","ROP","KLAC","LRCX","MCHP","SNPS","CDNS",
+]
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_sp500_tickers() -> list[str]:
-    """Pull S&P 500 constituent list from Wikipedia. Cached 1hr."""
+    """
+    Pull S&P 500 constituent list from Wikipedia.
+    Falls back to top-100 hardcoded list if Wikipedia fails.
+    Cached 1hr. Requires lxml in requirements.txt.
+    """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
-        tables = pd.read_html(url)
+        tables = pd.read_html(url, flavor="lxml")
         tickers = tables[0]["Symbol"].tolist()
-        # Wikipedia uses dots (BRK.B) — yfinance uses dashes (BRK-B)
-        return [t.replace(".", "-") for t in tickers]
+        result  = [str(t).replace(".", "-") for t in tickers]
+        if len(result) > 50:   # sanity check — real list has 503
+            return result
     except Exception:
-        return []
+        pass
+    # Wikipedia failed — use fallback
+    return _SP500_FALLBACK
 
 
-def screen_sp500_movers(progress_cb=None) -> list[dict]:
+def screen_sp500_movers(progress_cb=None) -> tuple[list[dict], str]:
     """
-    Pulls 2 days of daily OHLCV for all S&P 500 components,
-    computes daily % change, returns top 3 + bottom 3.
+    Downloads 5d OHLCV for S&P 500 in one yfinance call.
+    Returns (results, diagnostic_message).
     """
     import yfinance as yf
 
     tickers = fetch_sp500_tickers()
     if not tickers:
-        return []
+        return [], "Could not fetch ticker list."
 
     if progress_cb:
-        progress_cb(10, f"Fetching {len(tickers)} S&P 500 components…")
+        progress_cb(5, f"Downloading {len(tickers)} tickers…")
 
-    BATCH = 50
+    try:
+        raw = yf.download(
+            tickers     = tickers,
+            period      = "5d",
+            interval    = "1d",
+            auto_adjust = True,
+            progress    = False,
+            threads     = True,
+        )
+    except Exception as e:
+        return [], f"yfinance download failed: {e}"
+
+    if raw.empty:
+        return [], "yfinance returned empty data — Yahoo Finance may be rate-limiting. Wait 60s and retry."
+
+    if progress_cb:
+        progress_cb(80, "Computing % change…")
+
+    # Stable extraction — default yfinance layout: (Price, Ticker) MultiIndex
+    try:
+        if isinstance(raw.columns, pd.MultiIndex):
+            closes  = raw["Close"]
+            volumes = raw["Volume"]
+        else:
+            return [], "Unexpected data format from yfinance."
+    except KeyError as e:
+        return [], f"Column extraction failed: {e}"
+
+    closes  = closes.dropna(how="all")
+    volumes = volumes.dropna(how="all")
+
+    if len(closes) < 2:
+        return [], f"Not enough trading days returned (got {len(closes)}, need 2)."
+
+    prev_row = closes.iloc[-2]
+    curr_row = closes.iloc[-1]
+    vol_row  = volumes.iloc[-1] if len(volumes) > 0 else pd.Series(dtype=float)
+
     results = []
-
-    for i in range(0, len(tickers), BATCH):
-        batch = tickers[i: i + BATCH]
-        if progress_cb:
-            progress_cb(
-                10 + int(i / len(tickers) * 80),
-                f"Downloading batch {i // BATCH + 1} / {-(-len(tickers) // BATCH)}"
-            )
+    for t in tickers:
         try:
-            raw = yf.download(tickers=batch, period="5d", interval="1d",
-                              auto_adjust=True, progress=False, group_by="ticker")
-            if raw.empty:
+            prev = prev_row[t] if t in prev_row.index else float("nan")
+            curr = curr_row[t] if t in curr_row.index else float("nan")
+            vol  = vol_row[t]  if t in vol_row.index  else 0
+            prev, curr = float(prev), float(curr)
+            if prev != prev or curr != curr or prev <= 0:
                 continue
-
-            single = len(batch) == 1
-            for t in batch:
-                try:
-                    sub = _extract_hist(raw, t, single)
-                    if sub is None or len(sub) < 2:
-                        continue
-                    closes = sub["Close"].dropna().values.astype(float)
-                    if len(closes) < 2:
-                        continue
-                    prev_close, curr_close = closes[-2], closes[-1]
-                    if prev_close <= 0:
-                        continue
-                    pct = (curr_close - prev_close) / prev_close * 100
-                    vol = float(sub["Volume"].values[-1]) if "Volume" in sub.columns else 0
-                    results.append(dict(
-                        Ticker=t, Price=f"${curr_close:.2f}",
-                        Change=f"{pct:+.2f}%", Volume=f"{vol:,.0f}", _pct=pct,
-                    ))
-                except Exception:
-                    pass
-                    pass
+            pct = (curr - prev) / prev * 100
+            results.append(dict(
+                Ticker=t, Price=f"${curr:.2f}",
+                Change=f"{pct:+.2f}%", Volume=f"{int(vol):,}",
+                _pct=pct,
+            ))
         except Exception:
-            pass
-        time.sleep(0.2)
+            continue
 
     if not results:
-        return []
+        return [], f"Extracted 0 valid tickers out of {len(tickers)}. Yahoo may be blocking the request."
 
     results.sort(key=lambda r: r["_pct"], reverse=True)
     gainers = results[:3]
-    losers  = results[-3:][::-1]   # worst first
-
-    # Tag each row
+    losers  = results[-3:][::-1]
     for r in gainers: r["Side"] = "Gainer"
     for r in losers:  r["Side"] = "Loser"
 
-    return gainers + losers
+    diag = f"Processed {len(results)} / {len(tickers)} tickers successfully."
+    return gainers + losers, diag
 
-
-# ══════════════════════════════════════════════════════════════════
-#  PLOTLY CHART
-# ══════════════════════════════════════════════════════════════════
 
 def make_chart(ticker: str, hist: pd.DataFrame, pattern: str,
                ob_thr: float = 80, os_thr: float = 20) -> go.Figure:
@@ -691,14 +737,14 @@ def make_chart(ticker: str, hist: pd.DataFrame, pattern: str,
     return fig
 
 
-def make_gl_chart(ticker: str, hist: pd.DataFrame) -> go.Figure:
+def make_gl_chart(ticker: str, hist: pd.DataFrame, ema_period: int = 250) -> go.Figure:
     """Green Line chart: price + EMA(250) + Stochastic(5,1)."""
     c  = hist["Close"].values.astype(float)
     h  = hist["High"].values.astype(float)
     lo = hist["Low"].values.astype(float)
     v  = hist["Volume"].values.astype(float)
     dt = hist.index
-    e250 = ema_series(c, 250)
+    e250 = ema_series(c, ema_period)
 
     # Stochastic series
     k_series = np.full(len(c), np.nan)
@@ -721,7 +767,7 @@ def make_gl_chart(ticker: str, hist: pd.DataFrame) -> go.Figure:
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
         x=dt, y=e250, line=dict(color="#22c55e", width=1.8, dash="solid"),
-        name="EMA(250)", opacity=0.85, hovertemplate="EMA $%{y:.2f}<extra></extra>",
+        name=f"EMA({ema_period})", opacity=0.85, hovertemplate="EMA $%{y:.2f}<extra></extra>",
     ), row=1, col=1)
     fig.add_trace(go.Bar(
         x=dt, y=v, marker_color=bar_colors, opacity=0.55, name="Volume",
@@ -1023,6 +1069,7 @@ for key, default in [
     ("gl_cache",    {}),
     ("gl_done",     False),
     ("sp_results",  []),
+    ("sp_diag",     ""),
     ("sp_done",     False),
 ]:
     if key not in st.session_state:
@@ -1030,15 +1077,18 @@ for key, default in [
 
 RSI_COLS    = ["Ticker","Price","CurrVol","AvgVol","RSI9","Pattern"]
 RSI_RENAME  = {"CurrVol":"Curr Vol","AvgVol":"Avg Vol","RSI9":"RSI(9)"}
-GL_COLS     = ["Ticker","Price","AvgVol","EMA250","PctAboveEMA","RS","Stoch"]
-GL_RENAME   = {"AvgVol":"Avg Vol","EMA250":"EMA(250)","PctAboveEMA":"% > EMA","RS":"IBD-RS","Stoch":"Stoch(5,1)"}
+GL_COLS     = ["Ticker","Price","AvgVol","EMA","PctFromEMA","RS","Stoch"]
+GL_RENAME   = {"AvgVol":"Avg Vol","EMA":"EMA","PctFromEMA":"% from EMA","RS":"IBD-RS","Stoch":"Stoch(5,1)"}
 SP_COLS     = ["Ticker","Price","Change","Volume","Side"]
 
 # Filter defaults — always defined so tabs never get a NameError
 # regardless of which screen is active in the sidebar
-rsi9_ob    = 80.0
-rsi9_os    = 20.0
-gl_rs_thr  = 80.0
+rsi9_ob       = 80.0
+rsi9_os       = 20.0
+gl_rs_thr     = 80.0
+gl_ema_period = 250
+gl_mode       = "🟢  Bullish  (buy the dip)"
+gl_stoch_mode = "Stoch < 20 turning up  (oversold / buy)"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1070,15 +1120,33 @@ with st.sidebar:
 
     elif screen_choice == "Green Line":
         st.subheader("⚙️ Green Line Filters")
-        gl_min_price = st.number_input("Min Price ($)",  value=10.0,  step=5.0,  format="%.0f")
-        gl_avg_vol_k = st.number_input("Avg Vol (k)",    value=200,   step=100)
-        gl_rs_thr    = st.number_input("IBD-RS >",       value=80.0,  step=1.0,  format="%.0f")
+
+        gl_mode = st.radio(
+            "Screen Direction",
+            ["🟢  Bullish  (buy the dip)", "🔴  Bearish  (short the bounce)"],
+            index=0,
+            help="Bullish: RS > thr, Close > EMA, Stoch < 20 ↑\nBearish: RS < (100-thr), Close < EMA, Stoch > 80 ↓",
+        )
+        is_bullish = "Bullish" in gl_mode
+
+        gl_min_price = st.number_input("Min Price ($)",  value=100.0, step=5.0,  format="%.0f")
+        gl_avg_vol_k = st.number_input("Avg Vol (k)",    value=600,   step=100)
+        gl_ema_period = st.number_input("EMA Period",    value=250,   step=10, min_value=10)
+        gl_rs_thr    = st.number_input(
+            "IBD-RS >" if is_bullish else "IBD-RS <",
+            value=80.0, step=1.0, format="%.0f",
+        )
         st.caption(
-            "Rules:\n"
-            "1. Close > EMA(250)\n"
-            "2. IBD-RS percentile > threshold\n"
-            "3. Stoch(5,1) < 20 and turning up\n\n"
-            "⚠️ Needs 15mo data — runs slower than RSI screen."
+            ("Rules (Bullish):\n"
+             f"1. Close > EMA({int(gl_ema_period)})\n"
+             "2. IBD-RS > threshold\n"
+             "3. Stoch(5,1) < 20 and turning up"
+             if is_bullish else
+             "Rules (Bearish):\n"
+             f"1. Close < EMA({int(gl_ema_period)})\n"
+             "2. IBD-RS < (100 − threshold)\n"
+             "3. Stoch(5,1) > 80 and turning down")
+            + "\n\n⚠️ Needs 15mo data — runs slower."
         )
         st.markdown("---")
         scan_btn = st.button("⟳  SCAN GREEN LINE", type="primary", use_container_width=True)
@@ -1209,6 +1277,8 @@ with tab_gl:
             prog.progress(0.03, text=f"{len(tickers)} candidates → downloading 15mo data…")
             results, cache = screen_green_line(
                 tickers, gl_min_price, avg_vol, gl_rs_thr,
+                ema_period=int(gl_ema_period),
+                is_bullish=("Bullish" in gl_mode),
                 progress_cb=_gl_cb,
             )
             st.session_state.gl_results = results
@@ -1243,7 +1313,7 @@ with tab_gl:
             if sel and sel != "— select —":
                 hist = st.session_state.gl_cache.get(sel)
                 if hist is not None:
-                    st.plotly_chart(make_gl_chart(sel, hist), use_container_width=True)
+                    st.plotly_chart(make_gl_chart(sel, hist, ema_period), use_container_width=True)
         else:
             st.info(
                 "No stocks matched all three Green Line rules simultaneously.\n\n"
@@ -1266,8 +1336,9 @@ with tab_sp:
             prog.progress(pct / 100, text=msg)
 
         try:
-            results = screen_sp500_movers(progress_cb=_sp_cb)
+            results, diag = screen_sp500_movers(progress_cb=_sp_cb)
             st.session_state.sp_results = results
+            st.session_state.sp_diag    = diag
             st.session_state.sp_done    = True
             prog.empty()
         except Exception as e:
@@ -1278,6 +1349,12 @@ with tab_sp:
         results = st.session_state.sp_results
         gainers = [r for r in results if r["Side"] == "Gainer"]
         losers  = [r for r in results if r["Side"] == "Loser"]
+
+        diag = st.session_state.get("sp_diag", "")
+        if diag:
+            st.caption(f"ℹ️ {diag}")
+        if not results:
+            st.warning("No results returned. " + diag)
 
         if "sp_chart_ticker" not in st.session_state:
             st.session_state.sp_chart_ticker = None
