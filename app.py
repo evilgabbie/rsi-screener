@@ -61,14 +61,30 @@ st.markdown("""
     }
     h1, h2, h3, p, span, label { color: #c9d1d9; }
     div[data-testid="stDataFrame"] { border-radius: 8px; }
-    .stButton > button { border-radius: 6px; font-weight: 600; }
+    .stButton > button {
+        border-radius: 6px;
+        font-weight: 600;
+        background: #1e2736;
+        color: #c9d1d9;
+        border: 1px solid #2d3748;
+        padding: 4px 14px;
+        font-size: 0.85rem;
+    }
+    .stButton > button:hover {
+        background: #253047;
+        border-color: #388bfd;
+        color: #e6edf3;
+    }
     [data-testid="stCaptionContainer"] p { color: #6e7f96 !important; }
     .metric-box {
-        background: #1e2736; border-radius: 8px; padding: 14px 18px;
-        border-left: 4px solid; margin-bottom: 8px;
+        background: #1a2235;
+        border-radius: 10px;
+        padding: 16px 20px;
+        border-left: 5px solid;
+        margin-bottom: 10px;
     }
-    .metric-green { border-color: #3fb950; }
-    .metric-red   { border-color: #f85149; }
+    .metric-green { border-color: #3fb950; background: #0f1e14; }
+    .metric-red   { border-color: #f85149; background: #1e0f0f; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1384,14 +1400,19 @@ with tab_sp:
             for r in gainers:
                 st.markdown(
                     f"<div class='metric-box metric-green'>"
-                    f"<b style='font-size:1.1rem'>{r['Ticker']}</b>&nbsp;&nbsp;"
-                    f"<span style='color:#3fb950;font-size:1.2rem;font-weight:700'>{r['Change']}</span><br>"
-                    f"<span style='color:#6e7f96;font-size:0.85rem'>"
-                    f"Price {r['Price']} &nbsp;·&nbsp; Vol {r['Volume']}</span>"
+                    f"<span style='color:#e6edf3;font-size:1.15rem;font-weight:700;"
+                    f"letter-spacing:0.04em'>{r['Ticker']}</span>"
+                    f"&nbsp;&nbsp;"
+                    f"<span style='color:#3fb950;font-size:1.25rem;font-weight:800'>"
+                    f"{r['Change']}</span><br>"
+                    f"<span style='color:#a8b4c4;font-size:0.88rem;margin-top:4px;display:block'>"
+                    f"Price <b style='color:#c9d1d9'>{r['Price']}</b>"
+                    f"&nbsp;&nbsp;·&nbsp;&nbsp;"
+                    f"Vol <b style='color:#c9d1d9'>{r['Volume']}</b></span>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
-                if st.button(f"Chart {r['Ticker']}", key=f"gc_{r['Ticker']}"):
+                if st.button(f"📈 {r['Ticker']}", key=f"gc_{r['Ticker']}"):
                     st.session_state.sp_chart_ticker = r["Ticker"]
 
         with l_col:
@@ -1399,14 +1420,19 @@ with tab_sp:
             for r in losers:
                 st.markdown(
                     f"<div class='metric-box metric-red'>"
-                    f"<b style='font-size:1.1rem'>{r['Ticker']}</b>&nbsp;&nbsp;"
-                    f"<span style='color:#f85149;font-size:1.2rem;font-weight:700'>{r['Change']}</span><br>"
-                    f"<span style='color:#6e7f96;font-size:0.85rem'>"
-                    f"Price {r['Price']} &nbsp;·&nbsp; Vol {r['Volume']}</span>"
+                    f"<span style='color:#e6edf3;font-size:1.15rem;font-weight:700;"
+                    f"letter-spacing:0.04em'>{r['Ticker']}</span>"
+                    f"&nbsp;&nbsp;"
+                    f"<span style='color:#f85149;font-size:1.25rem;font-weight:800'>"
+                    f"{r['Change']}</span><br>"
+                    f"<span style='color:#a8b4c4;font-size:0.88rem;margin-top:4px;display:block'>"
+                    f"Price <b style='color:#c9d1d9'>{r['Price']}</b>"
+                    f"&nbsp;&nbsp;·&nbsp;&nbsp;"
+                    f"Vol <b style='color:#c9d1d9'>{r['Volume']}</b></span>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
-                if st.button(f"Chart {r['Ticker']}", key=f"lc_{r['Ticker']}"):
+                if st.button(f"📉 {r['Ticker']}", key=f"lc_{r['Ticker']}"):
                     st.session_state.sp_chart_ticker = r["Ticker"]
 
         selected = st.session_state.sp_chart_ticker
