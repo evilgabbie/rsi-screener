@@ -810,34 +810,93 @@ def make_chart(ticker: str, hist: pd.DataFrame, pattern: str,
     rsi_now = valid[-1] if len(valid) else float("nan")
 
     # ── Layout ─────────────────────────────────────────────────────────────
+    # ── Grid colours — charting paper style ───────────────────────────────
+    # Major gridlines: visible blue-grey (every 10 RSI, every week)
+    # Minor gridlines: faint (every 5 RSI)
+    GRID_MAJOR = "#1e3d5c"    # visible blue, like graph paper lines
+    GRID_MINOR = "#142840"    # faint between-lines
+
     fig.update_layout(
-        plot_bgcolor  = "#161b22",
+        plot_bgcolor  = "#0a1628",   # very dark navy — makes grid lines pop
         paper_bgcolor = "#0d1117",
         font          = dict(color="#e6edf3", size=11),
-        height        = 580,
+        height        = 600,
         showlegend    = True,
         legend        = dict(
             orientation="h",
             yanchor="bottom", y=1.01,
             xanchor="right",  x=1,
-            bgcolor="#1e2736",
-            bordercolor="#2d3748",
+            bgcolor="#0d1a2d",
+            bordercolor="#1e3d5c",
             font=dict(color="#c9d1d9", size=10),
         ),
-        margin      = dict(l=10, r=10, t=50, b=10),
+        margin      = dict(l=10, r=60, t=50, b=10),
         hovermode   = "x unified",
-        hoverlabel  = dict(bgcolor="#21262d", font_color="#e6edf3"),
+        hoverlabel  = dict(bgcolor="#0d1a2d", font_color="#e6edf3",
+                           bordercolor="#1e3d5c"),
     )
+
+    # ── X-axis: weekly major gridlines, shared ─────────────────────────────
     fig.update_xaxes(
-        gridcolor="#21262d", showgrid=True,
-        zeroline=False, rangeslider_visible=False,
+        gridcolor      = GRID_MAJOR,
+        gridwidth      = 1,
+        showgrid       = True,
+        zeroline       = False,
+        dtick          = 7 * 24 * 60 * 60 * 1000,   # 1 week in ms
+        tickformat     = "%b %d",
+        tickangle      = -35,
+        tickfont       = dict(color="#7a9bbf", size=9),
+        rangeslider_visible = False,
+        showline       = True,
+        linecolor      = GRID_MAJOR,
+        minor          = dict(
+            dtick      = 24 * 60 * 60 * 1000,        # daily minor lines
+            gridcolor  = GRID_MINOR,
+            gridwidth  = 1,
+            showgrid   = True,
+        ),
     )
-    fig.update_yaxes(gridcolor="#21262d", showgrid=True, zeroline=False)
-    fig.update_yaxes(tickprefix="$", row=1, col=1)
+
+    # ── Price panel y-axis ─────────────────────────────────────────────────
     fig.update_yaxes(
-        range=[0, 100],
-        tickvals=[0, 10, 20, 50, 80, 90, 100],
-        row=2, col=1,
+        row           = 1, col=1,
+        gridcolor     = GRID_MAJOR,
+        gridwidth     = 1,
+        showgrid      = True,
+        zeroline      = False,
+        tickprefix    = "$",
+        tickfont      = dict(color="#7a9bbf", size=9),
+        showline      = True,
+        linecolor     = GRID_MAJOR,
+        side          = "right",
+        minor         = dict(
+            gridcolor = GRID_MINOR,
+            gridwidth = 1,
+            showgrid  = True,
+            nticks    = 4,
+        ),
+    )
+
+    # ── RSI panel y-axis: every 10 major, every 5 minor ───────────────────
+    fig.update_yaxes(
+        row           = 2, col=1,
+        range         = [0, 100],
+        dtick         = 10,
+        tickvals      = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+        gridcolor     = GRID_MAJOR,
+        gridwidth     = 1,
+        showgrid      = True,
+        zeroline      = False,
+        tickfont      = dict(color="#7a9bbf", size=9),
+        showline      = True,
+        linecolor     = GRID_MAJOR,
+        side          = "right",
+        minor         = dict(
+            dtick     = 5,
+            gridcolor = GRID_MINOR,
+            gridwidth = 1,
+            showgrid  = True,
+        ),
     )
 
     # Update title with live RSI(Close)
